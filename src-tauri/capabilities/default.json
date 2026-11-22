@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The shell window. Windows that show the remote ComfyUI page are never listed here.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

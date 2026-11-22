@@ -1,0 +1,8 @@
+[package]
+name = "colab-comfy-core"
+description = "All the logic of colab-comfyUI. The Tauri shell only calls into this crate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true

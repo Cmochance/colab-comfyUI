@@ -1,0 +1,87 @@
+name: release
+
+# 推一个 v 开头的 tag 时，在 Apple 芯片和 Intel 上各跑一遍测试、各打一个 dmg，
+# 建一个 draft release 并把包传上去。
+# 这里只建 draft。发成正式版由人在 GitHub 上操作。
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.plat }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            plat: macOS-arm64
+          - os: macos-15-intel
+            plat: macOS-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: the tag must match Cargo.toml
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          test "v$version" = "$GITHUB_REF_NAME"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: make test
+        run: make test
+      - name: make dist
+        run: make dist
+      - name: the package is for this platform
+        env:
+          PLAT: ${{ matrix.plat }}
+        run: |
+          set -euo pipefail
+          cd dist
+          test -f "Colab-ComfyUI-$GITHUB_REF_NAME-$PLAT.dmg"
+          shasum -a 256 -c "Colab-ComfyUI-$GITHUB_REF_NAME-$PLAT.dmg.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.plat }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.dmg \
+            dist/*.dmg.sha256

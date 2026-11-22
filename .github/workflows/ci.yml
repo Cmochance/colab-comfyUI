@@ -1,0 +1,62 @@
+name: ci
+
+# 每次推到 main、打开或更新 pull request 时跑检查和测试，并把发布包打一遍。
+# draft pull request 跳过。跳过视为通过，不挡住 required check。
+# 这里不建 Colab 会话，不花计算单元。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Checks
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: make lint
+        run: make lint
+      - name: make test
+        run: make test
+      - name: make dist
+        run: make dist
+      # 发布包拿到别处也要能用：校验和对得上，dmg 里有 app 和指向 /Applications 的链接，签名完整。
+      - name: check the package
+        run: |
+          set -euo pipefail
+          cd dist
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' ../Cargo.toml)"
+          dmg="Colab-ComfyUI-v$version-macOS-arm64.dmg"
+          shasum -a 256 -c "$dmg.sha256"
+          mkdir -p unpacked/mnt unpacked/app
+          hdiutil attach -quiet -nobrowse -readonly -mountpoint unpacked/mnt "$dmg"
+          test "$(readlink unpacked/mnt/Applications)" = /Applications
+          ditto "unpacked/mnt/Colab ComfyUI.app" "unpacked/app/Colab ComfyUI.app"
+          hdiutil detach -quiet unpacked/mnt
+          app="unpacked/app/Colab ComfyUI.app"
+          plutil -lint "$app/Contents/Info.plist"
+          test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$version"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          lipo -archs "$app/Contents/MacOS/colab-comfyui" | grep -w arm64 > /dev/null

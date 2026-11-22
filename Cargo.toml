@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Cmochance"]
+repository = "https://github.com/Cmochance/colab-comfyUI"
+
+# tauri build 按 minimumSystemVersion 设置 MACOSX_DEPLOYMENT_TARGET。它是 13.0 时，release 默认的
+# strip 会让过程宏的 dylib 变成 dyld 不肯加载的文件（macOS 27.3 实测：mis-aligned LINKEDIT string pool），
+# 编译停在 can't find crate。只对过程宏关掉 strip 的话能编过，但最终的二进制同样是这种文件（实测），
+# 所以整个 release 都不 strip。
+[profile.release]
+strip = false

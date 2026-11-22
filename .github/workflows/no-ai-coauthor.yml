@@ -1,0 +1,108 @@
+name: no-ai-coauthor
+
+# 拦住带 AI Co-Authored-By trailer、AI 邮箱的 commit，以及由 AI bot 发起的 PR。
+# 把这个 check 加进 branch protection 的 required status checks 之后，
+# 这类 commit 或 bot 发起的 PR 不能 squash merge 进受保护分支。
+
+on:
+  pull_request:
+    # 不限制 base。stacked PR 在下面的 PR 合并后会自动改 base。
+    # 那一次改 base 不是新的事件；如果这里只监听 main，required check 会缺。
+    # 下面按 pull request 的 base..head 扫 commit，任意 base 都适用。
+    # ready_for_review 让 draft 转为可审查时再跑。draft 期间 job 跳过，跳过视为通过。
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-ai-coauthor:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Determine commit range
+        id: range
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ -n "${PR_HEAD_SHA:-}" ]; then
+            BASE="$PR_BASE_SHA"
+            HEAD="$PR_HEAD_SHA"
+          else
+            BASE="$PUSH_BEFORE"
+            HEAD="$PUSH_AFTER"
+          fi
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            # 新建仓库的第一次 push，before 是全 0。根提交没有父提交，HEAD~1 不存在。
+            if git rev-parse --verify "${HEAD}^" >/dev/null 2>&1; then
+              echo "range=$HEAD~1..$HEAD" >> "$GITHUB_OUTPUT"
+            else
+              echo "range=$HEAD" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "range=$BASE..$HEAD" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan commits for AI co-author / email
+        env:
+          RANGE: ${{ steps.range.outputs.range }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -eu
+          TRAILER_RE='Co-[Aa]uthored-[Bb]y:.*(anthropic|claude|openai|codex|chatgpt|gpt-|cursor|copilot|cursoragent|gemini|bard|devin|deepseek|qwen|mistral|llama)'
+          EMAIL_RE='@anthropic\.com|@openai\.com|cursoragent@cursor|copilot-swe-agent|[Cc]ursor@users\.noreply|[Cc]opilot@users\.noreply|noreply@google\.com|@devin\.ai|devin-ai-integration\[bot\]'
+          PR_AUTHOR_RE='^(devin-ai-integration|copilot-swe-agent|cursoragent|claude)\[bot\]$'
+
+          FAILED=0
+          if [ -n "${PR_AUTHOR:-}" ] && echo "$PR_AUTHOR" | grep -iE "$PR_AUTHOR_RE" > /dev/null; then
+            echo "::error::pull request author is an AI bot — $PR_AUTHOR"
+            echo "::error::GitHub squash merge attributes the commit to the PR author. Reopen the PR from a human account."
+            FAILED=1
+          fi
+
+          echo "Scanning commits in range: $RANGE"
+          COMMITS=$(git log --format='%H' "$RANGE")
+          COUNT=0
+          if [ -n "$COMMITS" ]; then
+            COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+          fi
+          echo "Commit count: $COUNT"
+
+          for sha in $COMMITS; do
+            short=$(git log -1 --format='%h' "$sha")
+            msg=$(git log -1 --format='%B' "$sha")
+            ae=$(git log -1 --format='%ae' "$sha")
+            ce=$(git log -1 --format='%ce' "$sha")
+
+            if echo "$msg" | grep -iE "$TRAILER_RE" > /dev/null; then
+              echo "::error::commit $short: AI Co-Authored-By trailer detected"
+              echo "$msg" | grep -iE "$TRAILER_RE" || true
+              FAILED=1
+            fi
+            if echo "$ae" | grep -iE "$EMAIL_RE" > /dev/null; then
+              echo "::error::commit $short: AI author email — $ae"
+              FAILED=1
+            fi
+            if echo "$ce" | grep -iE "$EMAIL_RE" > /dev/null; then
+              echo "::error::commit $short: AI committer email — $ce"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Found AI co-author trailer, AI email, or AI bot PR author in $RANGE."
+            echo "::error::Rewrite the commit message or reopen the PR from a human account, then push the corrected history."
+            exit 1
+          fi
+          echo "No AI co-author trailers, AI emails, or AI bot PR authors in $COUNT commits."

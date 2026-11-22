@@ -1,0 +1,20 @@
+.DS_Store
+
+# 编译和打包生成的
+target/
+node_modules/
+web/
+build/
+dist/
+src-tauri/gen/
+
+# 登录和密钥。不要放宽。
+*.token
+*.pem
+*.p8
+*.p12
+.env
+.env.*
+client_secret*.json
+*oauth*.json
+sessions.json
