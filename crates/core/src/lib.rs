@@ -2098,20 +2098,6 @@ impl SessionManager {
             }
         }
 
-        let has_another_stoppable = {
-            let guard = self.state.lock().await;
-            guard.active_session.is_some() || guard.pending_session.is_some()
-        };
-        if has_another_stoppable {
-            let report2 = self.stop_session().await.map_err(|e| UiError::from(&e))?;
-            if !report2.safe_to_clear_ledger {
-                return Err(UiError {
-                    code: "STOP_UNVERIFIED".to_string(),
-                    message: report2.summary,
-                });
-            }
-        }
-
         let disk = load_ledgers_checked(&self.data_dir);
         if let Some(err) = disk.corruption_error {
             Self::record_ui_error(&self.data_dir, &err);
@@ -2133,10 +2119,22 @@ impl SessionManager {
             || disk.pending.is_some()
             || self.has_running_or_pending_session().await
         {
-            return Err(UiError {
+            let err = UiError {
                 code: "STOP_UNVERIFIED".to_string(),
-                message: "本地仍存在未解除的会话保护记录，已阻止自动退出；请先核对状态或显式选择「保留云端运行，仅退出 App」。".to_string(),
-            });
+                message: "本地仍存在未解除的会话保护记录（如孤儿待核对或跨状态残留），已阻止按名称盲停与自动退出；请先核对状态或显式选择「保留云端运行，仅退出 App」。".to_string(),
+            };
+            Self::record_ui_error(&self.data_dir, &err);
+            {
+                let mut guard = self.state.lock().await;
+                guard.active_session = disk.active;
+                guard.pending_session = disk.pending;
+                guard.phase = SessionPhase::Error;
+                guard.step = None;
+                guard.last_error = Some(err.clone());
+                guard.sync_managed_flag();
+            }
+            self.notify_snapshot();
+            return Err(err);
         }
         Ok(())
     }
@@ -3456,5 +3454,99 @@ mod tests {
             ));
             assert_eq!(mgr.snapshot().await.phase, SessionPhase::Idle);
         });
+    }
+
+    #[test]
+    fn stop_for_exit_spares_replacement_runtime_and_blocks_quit_when_uncertain_pending_remains() {
+        let tmp = ShortTempDir::new();
+        let home = tmp.0.join("h");
+        let data = tmp.0.join("d");
+        install_fake_colab(&home);
+        let sname = default_session_name_for_email("alice@example.com");
+
+        save_json_0600(
+            &active_session_path(&data),
+            &ActiveSession {
+                session_name: sname.clone(),
+                owner_email: "alice@example.com".to_string(),
+                endpoint_sha256: sha256_hex(b"m-s-old"),
+                gpu: GpuTier::T4,
+                high_mem: false,
+                hardware_summary: "NVIDIA T4".to_string(),
+                local_port: LOCAL_PROXY_PORT,
+                created_at_unix: 100,
+            },
+        )
+        .unwrap();
+        save_json_0600(
+            &pending_session_path(&data),
+            &PendingSession {
+                session_name: sname.clone(),
+                owner_email: "alice@example.com".to_string(),
+                gpu: GpuTier::T4,
+                high_mem: false,
+                cancel_requested: false,
+                uncertain_orphan: true,
+                created_at_unix: 90,
+            },
+        )
+        .unwrap();
+
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let stop_calls_srv = stop_calls.clone();
+        let runner = Arc::new(SmartRunner {
+            responder: Box::new(move |spec| {
+                let sname = sname.clone();
+                let stop_calls_srv = stop_calls_srv.clone();
+                let prog = spec.program.clone();
+                let args = spec.args.clone();
+                Box::pin(async move {
+                    if prog == Path::new(crate::locate::SCUTIL_BIN) {
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let sub = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .map(String::as_str);
+                    let out = match sub {
+                        Some("whoami") => "Email: alice@example.com\n".to_string(),
+                        Some("usage") => "Current balance: 10.00 compute units\nUsage rate: 1.50/hr\nActive assignments: 1".to_string(),
+                        Some("status") => format!("[{sname}] m-s-replacement | Hardware: NVIDIA T4 | Shape: Standard | Variant: GPU"),
+                        Some("sessions") => format!("[{sname}] m-s-replacement | Hardware: NVIDIA T4 | Shape: Standard | Variant: GPU"),
+                        Some("stop") => {
+                            stop_calls_srv.fetch_add(1, Ordering::SeqCst);
+                            "[colab] Session terminated.".to_string()
+                        }
+                        _ => String::new(),
+                    };
+                    Ok(CommandOutput::from_raw(Some(0), out, String::new()))
+                })
+            }),
+        });
+
+        let mgr = SessionManager::with_deps(
+            data.clone(),
+            Some(home),
+            Some(OsString::from("/usr/bin:/bin")),
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        );
+
+        let err = block_on(mgr.stop_session_for_exit()).unwrap_err();
+        assert_eq!(err.code, "STOP_UNVERIFIED");
+        assert_eq!(
+            stop_calls.load(Ordering::SeqCst),
+            0,
+            "must never invoke name-only colab stop against an external replacement runtime"
+        );
+        assert!(!active_session_path(&data).exists());
+        assert!(pending_session_path(&data).exists());
+        assert!(mgr.has_running_or_pending_session_sync());
+        assert_eq!(block_on(mgr.snapshot()).phase, SessionPhase::Error);
     }
 }
