@@ -295,12 +295,13 @@ pub fn run() {
         .map(|h| h.join(".colab-comfyui"))
         .unwrap_or_else(|| PathBuf::from("/tmp/colab-comfyui"));
     let path_env: Option<OsString> = std::env::var_os("PATH");
+    let https_proxy = std::env::var_os("HTTPS_PROXY").or_else(|| std::env::var_os("https_proxy"));
+    let http_proxy = std::env::var_os("HTTP_PROXY").or_else(|| std::env::var_os("http_proxy"));
 
-    let manager = Arc::new(SessionManager::new(
-        data_dir.clone(),
-        home_dir.clone(),
-        path_env,
-    ));
+    let manager = Arc::new(
+        SessionManager::new(data_dir.clone(), home_dir.clone(), path_env)
+            .with_proxy_hints(https_proxy, http_proxy),
+    );
     let allow_immediate_exit = Arc::new(AtomicBool::new(false));
 
     let app = tauri::Builder::default()

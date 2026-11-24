@@ -190,6 +190,7 @@
         showZeroCuModal = true;
       } else {
         actionError = uiErr;
+        logsExpanded = true;
       }
     } finally {
       busy = false;
@@ -208,6 +209,7 @@
       snap = await invoke<AppSnapshot>('reconnect_tunnel');
     } catch (err) {
       actionError = err as UiError;
+      logsExpanded = true;
     } finally {
       busy = false;
     }
@@ -433,7 +435,8 @@
       {#each STEPS as step, idx}
         <li
           class:done={activeStepIndex > idx || (snap?.phase === 'Ready' && idx === STEPS.length - 1)}
-          class:active={activeStepIndex === idx && snap?.phase !== 'Ready'}
+          class:active={activeStepIndex === idx && (snap?.phase === 'Starting' || snap?.phase === 'Reconnecting')}
+          class:failed={activeStepIndex === idx && snap?.phase === 'Error'}
         >
           {t(step.labelKey, step.fallback)}
         </li>
@@ -738,6 +741,13 @@
   .steps li.active {
     opacity: 1;
     border: 1px solid #0a84ff;
+    font-weight: 600;
+  }
+
+  .steps li.failed {
+    opacity: 1;
+    border: 1px solid #d93829;
+    background: light-dark(#fef2f2, #3f1818);
     font-weight: 600;
   }
 

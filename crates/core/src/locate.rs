@@ -1,14 +1,18 @@
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::runner::{CommandRunner, CommandSpec};
 
 pub const COLAB_BIN: &str = "colab";
 pub const SSH_BIN: &str = "/usr/bin/ssh";
 pub const SSH_KEYGEN_BIN: &str = "/usr/bin/ssh-keygen";
 pub const LSOF_BIN: &str = "/usr/sbin/lsof";
 pub const OPEN_BIN: &str = "/usr/bin/open";
+pub const SCUTIL_BIN: &str = "/usr/sbin/scutil";
 
 /// Environment readiness report for external binaries required by Phase 1.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +54,94 @@ pub fn check_env(path_env: Option<&OsStr>, home: Option<&Path>) -> EnvReport {
         ssh_available: is_executable(Path::new(SSH_BIN)),
         ssh_keygen_available: is_executable(Path::new(SSH_KEYGEN_BIN)),
     }
+}
+
+/// Parses `scutil --proxy` output into uppercase/lowercase HTTP/HTTPS proxy env vars
+/// so Python `websocket-client` (`colab ssh --proxy-mode`) honors macOS system proxies
+/// even when launched from Finder.
+pub fn parse_scutil_proxy_envs(scutil_stdout: &str) -> Vec<(String, String)> {
+    let mut http_enable = false;
+    let mut http_host: Option<String> = None;
+    let mut http_port: Option<u16> = None;
+    let mut https_enable = false;
+    let mut https_host: Option<String> = None;
+    let mut https_port: Option<u16> = None;
+
+    for line in scutil_stdout.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim();
+        match key {
+            "HTTPEnable" => http_enable = val == "1",
+            "HTTPProxy" if !val.is_empty() => http_host = Some(val.to_string()),
+            "HTTPPort" => http_port = val.parse::<u16>().ok(),
+            "HTTPSEnable" => https_enable = val == "1",
+            "HTTPSProxy" if !val.is_empty() => https_host = Some(val.to_string()),
+            "HTTPSPort" => https_port = val.parse::<u16>().ok(),
+            _ => {}
+        }
+    }
+
+    let mut envs = Vec::new();
+    if http_enable {
+        if let (Some(h), Some(p)) = (http_host, http_port) {
+            let url = format!("http://{h}:{p}");
+            envs.push(("HTTP_PROXY".to_string(), url.clone()));
+            envs.push(("http_proxy".to_string(), url));
+        }
+    }
+    if https_enable {
+        if let (Some(h), Some(p)) = (https_host, https_port) {
+            let url = format!("http://{h}:{p}");
+            envs.push(("HTTPS_PROXY".to_string(), url.clone()));
+            envs.push(("https_proxy".to_string(), url));
+        }
+    }
+    if !envs.is_empty() {
+        envs.push(("NO_PROXY".to_string(), "127.0.0.1,localhost".to_string()));
+        envs.push(("no_proxy".to_string(), "127.0.0.1,localhost".to_string()));
+    }
+    envs
+}
+
+/// Resolves proxy env vars from injected process env hints first, falling back to
+/// macOS `/usr/sbin/scutil --proxy` when launched from Finder with an empty proxy env.
+pub async fn resolve_proxy_envs(
+    runner: &dyn CommandRunner,
+    env_https: Option<&OsStr>,
+    env_http: Option<&OsStr>,
+) -> Vec<(String, String)> {
+    let mut envs = Vec::new();
+    if let Some(val) = env_https.and_then(|v| v.to_str()).filter(|s| !s.is_empty()) {
+        envs.push(("HTTPS_PROXY".to_string(), val.to_string()));
+        envs.push(("https_proxy".to_string(), val.to_string()));
+    }
+    if let Some(val) = env_http.and_then(|v| v.to_str()).filter(|s| !s.is_empty()) {
+        envs.push(("HTTP_PROXY".to_string(), val.to_string()));
+        envs.push(("http_proxy".to_string(), val.to_string()));
+    }
+    if !envs.is_empty() {
+        envs.push(("NO_PROXY".to_string(), "127.0.0.1,localhost".to_string()));
+        envs.push(("no_proxy".to_string(), "127.0.0.1,localhost".to_string()));
+        return envs;
+    }
+
+    if !is_executable(Path::new(SCUTIL_BIN)) {
+        return envs;
+    }
+    let spec = CommandSpec::new(
+        SCUTIL_BIN,
+        vec!["--proxy".to_string()],
+        Duration::from_secs(3),
+    );
+    if let Ok(out) = runner.run(spec, None).await {
+        if out.exit_code == Some(0) {
+            return parse_scutil_proxy_envs(&out.stdout);
+        }
+    }
+    envs
 }
 
 #[cfg(unix)]
@@ -176,5 +268,32 @@ mod tests {
         assert_eq!(report.colab_path, Some(colab.display().to_string()));
         assert!(report.ssh_available);
         assert!(report.ssh_keygen_available);
+    }
+
+    #[test]
+    fn parse_scutil_proxy_extracts_http_and_https_endpoints() {
+        let sample = r#"<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7897
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7897
+  HTTPSProxy : 127.0.0.1
+  SOCKSEnable : 0
+}"#;
+        let envs = parse_scutil_proxy_envs(sample);
+        assert!(envs.contains(&(
+            "HTTPS_PROXY".to_string(),
+            "http://127.0.0.1:7897".to_string()
+        )));
+        assert!(envs.contains(&(
+            "https_proxy".to_string(),
+            "http://127.0.0.1:7897".to_string()
+        )));
+        assert!(envs.contains(&(
+            "HTTP_PROXY".to_string(),
+            "http://127.0.0.1:7897".to_string()
+        )));
+        assert!(envs.contains(&("NO_PROXY".to_string(), "127.0.0.1,localhost".to_string())));
     }
 }

@@ -38,18 +38,27 @@ fn live_session_lifecycle_mux_and_stop() {
     let colab_bin = find_colab(path_env.as_deref(), home.as_deref())
         .expect("colab binary must be installed for COLAB_LIVE=1");
 
-    // Isolate from user's running app port 18188 by using 18288 for live integration test.
+    // Isolate from user's running app port 18188 and session name by using 18288 + comfy-live-<pid>.
     let live_port: u16 = 18288;
-    let mgr = Arc::new(SessionManager::with_deps(
-        data_dir.clone(),
-        home,
-        path_env,
-        live_port,
-        Arc::new(TokioCommandRunner),
-        Arc::new(colab_comfy_core::ssh_tunnel::TokioTunnelSpawner),
-    ));
+    let live_session_name = format!("comfy-live-{}", pid % 100_000);
+    let https_proxy = env::var_os("HTTPS_PROXY").or_else(|| env::var_os("https_proxy"));
+    let http_proxy = env::var_os("HTTP_PROXY").or_else(|| env::var_os("http_proxy"));
+    let mgr = Arc::new(
+        SessionManager::with_deps(
+            data_dir.clone(),
+            home,
+            path_env,
+            live_port,
+            Arc::new(TokioCommandRunner),
+            Arc::new(colab_comfy_core::ssh_tunnel::TokioTunnelSpawner),
+        )
+        .with_proxy_hints(https_proxy, http_proxy)
+        .with_session_name_override(live_session_name.clone())
+        .expect("valid live session name"),
+    );
 
     let result = block_on(async {
+        eprintln!("[COLAB_LIVE] starting T4 session '{live_session_name}'...");
         let snap = mgr.start_session(GpuTier::T4, false, true).await?;
         let session_name = snap
             .active_session
@@ -57,6 +66,7 @@ fn live_session_lifecycle_mux_and_stop() {
             .expect("active session after start")
             .session_name
             .clone();
+        eprintln!("[COLAB_LIVE] session '{session_name}' ready, testing ControlMaster mux...");
 
         // 1. Test ControlMaster multiplexing: run 3 concurrent probes over -S <ctl>
         // without causing HTTP 429 on single-slot plans.
@@ -95,6 +105,7 @@ fn live_session_lifecycle_mux_and_stop() {
         assert_eq!(r1.1.trim(), "MUX_PROBE_1");
         assert_eq!(r2.1.trim(), "MUX_PROBE_2");
         assert_eq!(r3.0, Some(0));
+        eprintln!("[COLAB_LIVE] 3 concurrent ControlMaster mux probes passed");
 
         // 2. Test local_proxy Host enforcement + /system_stats roundtrip
         let mut ok_stream = TcpStream::connect(("127.0.0.1", live_port)).await.unwrap();
@@ -120,6 +131,7 @@ fn live_session_lifecycle_mux_and_stop() {
         let mut evil_resp = String::new();
         evil_stream.read_to_string(&mut evil_resp).await.unwrap();
         assert!(evil_resp.starts_with("HTTP/1.1 403"));
+        eprintln!("[COLAB_LIVE] local_proxy /system_stats (200) and Host check (403) passed");
 
         // 3. Stop and verify billing stopped
         let stop_report = mgr.stop_session().await?;
@@ -129,9 +141,9 @@ fn live_session_lifecycle_mux_and_stop() {
             "endpoint still present after stop"
         );
 
-        let usage = colab_cli::usage(&TokioCommandRunner, &colab_bin, None).await?;
+        let usage = colab_cli::usage(&TokioCommandRunner, &colab_bin, &[], None).await?;
         eprintln!(
-            "COLAB_LIVE stop verified for {session_name}: active_assignments={}, usage_rate={:.2}/hr",
+            "[COLAB_LIVE] stop verified for {session_name}: active_assignments={}, usage_rate={:.2}/hr",
             usage.active_assignments, usage.usage_rate_hourly
         );
         Ok::<(), colab_comfy_core::CoreError>(())

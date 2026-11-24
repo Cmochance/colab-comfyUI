@@ -52,24 +52,36 @@ impl TunnelProcess for TokioTunnelProcess {
 
 /// Spawns the `ssh -M` ControlMaster child process.
 pub trait TunnelSpawner: Send + Sync {
-    fn spawn(&self, program: &Path, args: &[String]) -> Result<Box<dyn TunnelProcess>, CoreError>;
+    fn spawn(
+        &self,
+        program: &Path,
+        args: &[String],
+        envs: &[(String, String)],
+    ) -> Result<Box<dyn TunnelProcess>, CoreError>;
 }
 
 #[derive(Debug, Default)]
 pub struct TokioTunnelSpawner;
 
 impl TunnelSpawner for TokioTunnelSpawner {
-    fn spawn(&self, program: &Path, args: &[String]) -> Result<Box<dyn TunnelProcess>, CoreError> {
-        let child = Command::new(program)
-            .args(args)
+    fn spawn(
+        &self,
+        program: &Path,
+        args: &[String],
+        envs: &[(String, String)],
+    ) -> Result<Box<dyn TunnelProcess>, CoreError> {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| CoreError::Io {
-                context: format!("spawn {}", program.display()),
-                source,
-            })?;
+            .stderr(Stdio::piped());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().map_err(|source| CoreError::Io {
+            context: format!("spawn {}", program.display()),
+            source,
+        })?;
         Ok(Box::new(TokioTunnelProcess { child }))
     }
 }
@@ -255,6 +267,7 @@ pub async fn verify_tunnel_preconditions(
     colab_bin: &Path,
     expected: &ActiveSession,
     runner: &dyn CommandRunner,
+    proxy_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<usize, CoreError> {
     let _lock = StateLock::acquire(data_dir, LOCK_TIMEOUT).await?;
@@ -277,7 +290,7 @@ pub async fn verify_tunnel_preconditions(
         }
     }
 
-    let actual_email = colab_cli::whoami(runner, colab_bin, on_line.clone()).await?;
+    let actual_email = colab_cli::whoami(runner, colab_bin, proxy_envs, on_line.clone()).await?;
     if !actual_email.eq_ignore_ascii_case(expected.owner_email.trim()) {
         return Err(CoreError::AccountMismatch {
             expected_email: expected.owner_email.clone(),
@@ -285,7 +298,15 @@ pub async fn verify_tunnel_preconditions(
         });
     }
 
-    match colab_cli::status(runner, colab_bin, &expected.session_name, on_line.clone()).await? {
+    match colab_cli::status(
+        runner,
+        colab_bin,
+        &expected.session_name,
+        proxy_envs,
+        on_line.clone(),
+    )
+    .await?
+    {
         SessionStatusLookup::Present(entry) => {
             if entry.endpoint_sha256 != expected.endpoint_sha256 {
                 return Err(CoreError::SessionLedgerMismatch {
@@ -300,7 +321,7 @@ pub async fn verify_tunnel_preconditions(
         }
     }
 
-    let pre_sessions = colab_cli::sessions(runner, colab_bin, on_line).await?;
+    let pre_sessions = colab_cli::sessions(runner, colab_bin, proxy_envs, on_line).await?;
     Ok(pre_sessions.len())
 }
 
@@ -319,10 +340,18 @@ pub async fn start_master_and_verify(
     session: &ActiveSession,
     runner: &dyn CommandRunner,
     spawner: &dyn TunnelSpawner,
+    proxy_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<StartedMasterTunnel, CoreError> {
-    let pre_count =
-        verify_tunnel_preconditions(data_dir, colab_bin, session, runner, on_line.clone()).await?;
+    let pre_count = verify_tunnel_preconditions(
+        data_dir,
+        colab_bin,
+        session,
+        runner,
+        proxy_envs,
+        on_line.clone(),
+    )
+    .await?;
     ensure_ed25519_key(data_dir, runner).await?;
 
     let ctl_sock = ctl_socket_path(data_dir, &session.session_name)?;
@@ -339,7 +368,7 @@ pub async fn start_master_and_verify(
         &session.session_name,
     )?;
 
-    let mut process = spawner.spawn(Path::new(SSH_BIN), &args)?;
+    let mut process = spawner.spawn(Path::new(SSH_BIN), &args, proxy_envs)?;
 
     let deadline = tokio::time::Instant::now() + MASTER_READY_TIMEOUT;
     loop {
@@ -363,7 +392,7 @@ pub async fn start_master_and_verify(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    let post_count = colab_cli::sessions(runner, colab_bin, on_line)
+    let post_count = colab_cli::sessions(runner, colab_bin, proxy_envs, on_line)
         .await
         .map(|v| v.len())
         .unwrap_or(pre_count);
@@ -457,6 +486,7 @@ mod tests {
             &self,
             _program: &Path,
             args: &[String],
+            _envs: &[(String, String)],
         ) -> Result<Box<dyn TunnelProcess>, CoreError> {
             self.spawn_count.fetch_add(1, Ordering::SeqCst);
             *self.last_args.lock().unwrap() = args.to_vec();
@@ -563,6 +593,7 @@ mod tests {
             &session,
             &runner_mismatch,
             &spawner,
+            &[],
             None,
         ))
         .err()
@@ -589,6 +620,7 @@ mod tests {
             &session,
             &runner_missing,
             &spawner,
+            &[],
             None,
         ))
         .err()
@@ -652,6 +684,7 @@ mod tests {
             &session,
             &runner,
             &spawner,
+            &[],
             None,
         ))
         .unwrap();

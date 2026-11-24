@@ -8,8 +8,10 @@ use crate::runner::{CommandOutput, CommandRunner, CommandSpec, LineCallback, Std
 use crate::CoreError;
 
 const CLI_SHORT_TIMEOUT: Duration = Duration::from_secs(45);
-const CLI_NEW_TIMEOUT: Duration = Duration::from_secs(360);
+const CLI_NEW_TIMEOUT: Duration = Duration::from_secs(600);
 const CLI_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+const COLAB_SHORT_REQ_TIMEOUT_SECS: &str = "30";
+const COLAB_NEW_REQ_TIMEOUT_SECS: &str = "120";
 
 /// Parsed output of `colab usage`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,11 +54,22 @@ pub struct StopReport {
     pub warnings: Vec<String>,
 }
 
-fn colab_spec(colab_bin: &Path, args: Vec<String>, timeout: Duration) -> CommandSpec {
+fn colab_spec(
+    colab_bin: &Path,
+    args: Vec<String>,
+    timeout: Duration,
+    req_timeout_secs: &str,
+    extra_envs: &[(String, String)],
+) -> CommandSpec {
     let mut spec = CommandSpec::new(colab_bin, args, timeout);
     spec.stdin = StdinPolicy::Null;
+    spec.envs.extend(extra_envs.iter().cloned());
+    spec.envs.push((
+        "COLAB_CLI_REQUEST_TIMEOUT".to_string(),
+        req_timeout_secs.to_string(),
+    ));
     spec.envs
-        .push(("COLAB_CLI_REQUEST_TIMEOUT".to_string(), "30".to_string()));
+        .push(("PYTHONUNBUFFERED".to_string(), "1".to_string()));
     spec
 }
 
@@ -330,11 +343,18 @@ pub fn build_new_args(
 pub async fn whoami(
     runner: &dyn CommandRunner,
     colab_bin: &Path,
+    extra_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<String, CoreError> {
     let out = runner
         .run(
-            colab_spec(colab_bin, vec!["whoami".to_string()], CLI_SHORT_TIMEOUT),
+            colab_spec(
+                colab_bin,
+                vec!["whoami".to_string()],
+                CLI_SHORT_TIMEOUT,
+                COLAB_SHORT_REQ_TIMEOUT_SECS,
+                extra_envs,
+            ),
             on_line,
         )
         .await?;
@@ -344,11 +364,18 @@ pub async fn whoami(
 pub async fn usage(
     runner: &dyn CommandRunner,
     colab_bin: &Path,
+    extra_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<UsageInfo, CoreError> {
     let out = runner
         .run(
-            colab_spec(colab_bin, vec!["usage".to_string()], CLI_SHORT_TIMEOUT),
+            colab_spec(
+                colab_bin,
+                vec!["usage".to_string()],
+                CLI_SHORT_TIMEOUT,
+                COLAB_SHORT_REQ_TIMEOUT_SECS,
+                extra_envs,
+            ),
             on_line,
         )
         .await?;
@@ -359,6 +386,7 @@ pub async fn status(
     runner: &dyn CommandRunner,
     colab_bin: &Path,
     session_name: &str,
+    extra_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<SessionStatusLookup, CoreError> {
     validate_session_name(session_name)?;
@@ -372,6 +400,8 @@ pub async fn status(
                     session_name.to_string(),
                 ],
                 CLI_SHORT_TIMEOUT,
+                COLAB_SHORT_REQ_TIMEOUT_SECS,
+                extra_envs,
             ),
             on_line,
         )
@@ -382,11 +412,18 @@ pub async fn status(
 pub async fn sessions(
     runner: &dyn CommandRunner,
     colab_bin: &Path,
+    extra_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<Vec<SessionEntry>, CoreError> {
     let out = runner
         .run(
-            colab_spec(colab_bin, vec!["sessions".to_string()], CLI_SHORT_TIMEOUT),
+            colab_spec(
+                colab_bin,
+                vec!["sessions".to_string()],
+                CLI_SHORT_TIMEOUT,
+                COLAB_SHORT_REQ_TIMEOUT_SECS,
+                extra_envs,
+            ),
             on_line,
         )
         .await?;
@@ -399,11 +436,21 @@ pub async fn new_session(
     session_name: &str,
     gpu: GpuTier,
     high_mem: bool,
+    extra_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<(), CoreError> {
     let args = build_new_args(session_name, gpu, high_mem)?;
     let out = runner
-        .run(colab_spec(colab_bin, args, CLI_NEW_TIMEOUT), on_line)
+        .run(
+            colab_spec(
+                colab_bin,
+                args,
+                CLI_NEW_TIMEOUT,
+                COLAB_NEW_REQ_TIMEOUT_SECS,
+                extra_envs,
+            ),
+            on_line,
+        )
         .await?;
     parse_new_output(gpu, &out)
 }
@@ -412,6 +459,7 @@ pub async fn open_url(
     runner: &dyn CommandRunner,
     colab_bin: &Path,
     session_name: &str,
+    extra_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<(), CoreError> {
     validate_session_name(session_name)?;
@@ -426,6 +474,8 @@ pub async fn open_url(
                     "--open".to_string(),
                 ],
                 CLI_SHORT_TIMEOUT,
+                COLAB_SHORT_REQ_TIMEOUT_SECS,
+                extra_envs,
             ),
             on_line,
         )
@@ -444,11 +494,18 @@ pub async fn open_url(
 pub async fn open_pay(
     runner: &dyn CommandRunner,
     colab_bin: &Path,
+    extra_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<(), CoreError> {
     let out = runner
         .run(
-            colab_spec(colab_bin, vec!["pay".to_string()], CLI_SHORT_TIMEOUT),
+            colab_spec(
+                colab_bin,
+                vec!["pay".to_string()],
+                CLI_SHORT_TIMEOUT,
+                COLAB_SHORT_REQ_TIMEOUT_SECS,
+                extra_envs,
+            ),
             on_line,
         )
         .await?;
@@ -469,6 +526,7 @@ pub async fn stop_and_verify(
     session_name: &str,
     owner_email: &str,
     expected_endpoint_sha256: Option<&str>,
+    extra_envs: &[(String, String)],
     on_line: Option<LineCallback>,
 ) -> Result<StopReport, CoreError> {
     validate_session_name(session_name)?;
@@ -482,6 +540,8 @@ pub async fn stop_and_verify(
                     session_name.to_string(),
                 ],
                 CLI_STOP_TIMEOUT,
+                COLAB_SHORT_REQ_TIMEOUT_SECS,
+                extra_envs,
             ),
             on_line.clone(),
         )
@@ -501,7 +561,7 @@ pub async fn stop_and_verify(
         ));
     }
 
-    let owner_verified = match whoami(runner, colab_bin, on_line.clone()).await {
+    let owner_verified = match whoami(runner, colab_bin, extra_envs, on_line.clone()).await {
         Ok(actual) => {
             if actual.eq_ignore_ascii_case(owner_email.trim()) {
                 true
@@ -521,7 +581,7 @@ pub async fn stop_and_verify(
     let endpoint_absent = if !owner_verified {
         false
     } else {
-        match sessions(runner, colab_bin, on_line.clone()).await {
+        match sessions(runner, colab_bin, extra_envs, on_line.clone()).await {
             Ok(list) => match expected_endpoint_sha256 {
                 Some(hash) => {
                     let still_present = list.iter().any(|s| s.endpoint_sha256 == hash);
@@ -540,7 +600,7 @@ pub async fn stop_and_verify(
     };
 
     let usage_res = if owner_verified {
-        match usage(runner, colab_bin, on_line).await {
+        match usage(runner, colab_bin, extra_envs, on_line).await {
             Ok(u) => Some(u),
             Err(err) => {
                 warnings.push(format!("未能核对 colab usage 速率：{err}"));
@@ -652,7 +712,16 @@ mod tests {
                 assert!(spec
                     .envs
                     .iter()
-                    .any(|(k, v)| k == "COLAB_CLI_REQUEST_TIMEOUT" && v == "30"));
+                    .any(|(k, v)| k == "PYTHONUNBUFFERED" && v == "1"));
+                let expected_req_timeout = if next.expected_subcmd == "new" {
+                    "120"
+                } else {
+                    "30"
+                };
+                assert!(spec
+                    .envs
+                    .iter()
+                    .any(|(k, v)| k == "COLAB_CLI_REQUEST_TIMEOUT" && v == expected_req_timeout));
                 next.output
             })
         }
@@ -805,6 +874,7 @@ mod tests {
             "comfy-1234abcd",
             "alice@example.com",
             Some(&endpoint_hash),
+            &[],
             None,
         ))
         .unwrap();
@@ -852,11 +922,34 @@ mod tests {
             "comfy-1234abcd",
             "alice@example.com",
             Some(&endpoint_hash),
+            &[],
             None,
         ))
         .unwrap();
         assert!(!report_fail.terminated_sentinel);
         assert!(!report_fail.endpoint_absent);
         assert!(!report_fail.billing_verified_stopped);
+    }
+
+    #[test]
+    fn new_session_uses_120s_request_timeout_and_unbuffered_python() {
+        let runner = FakeRunner::new(vec![FakeCall {
+            expected_subcmd: "new".to_string(),
+            output: Ok(CommandOutput::from_raw(
+                Some(0),
+                "[colab] Session READY.\n".to_string(),
+                String::new(),
+            )),
+        }]);
+        block_on(new_session(
+            &runner,
+            Path::new("/usr/local/bin/colab"),
+            "comfy-1234abcd",
+            GpuTier::L4,
+            false,
+            &[],
+            None,
+        ))
+        .unwrap();
     }
 }

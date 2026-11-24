@@ -27,12 +27,12 @@ use crate::colab_cli::{SessionEntry, SessionStatusLookup, StopReport, UsageInfo}
 use crate::config::{
     active_session_path, config_path, ctl_socket_path, default_session_name_for_email,
     ensure_data_dirs, load_json_opt, pending_session_path, remove_if_exists, save_json_0600,
-    ActiveSession, AppConfig, GpuTier, PendingSession, StateLock, LOCAL_PROXY_PORT,
-    REMOTE_COMFY_PORT,
+    validate_session_name, ActiveSession, AppConfig, GpuTier, PendingSession, StateLock,
+    LOCAL_PROXY_PORT, REMOTE_COMFY_PORT,
 };
 use crate::i18n::message_table;
 use crate::local_proxy::{start_local_proxy, LocalProxyHandle};
-use crate::locate::{check_env, EnvReport};
+use crate::locate::{check_env, resolve_proxy_envs, EnvReport};
 use crate::runner::{CommandRunner, LineCallback, StdinPolicy, TokioCommandRunner};
 use crate::ssh_tunnel::{
     build_mux_exec_spec, start_master_and_verify, stop_master_tunnel, TokioTunnelSpawner,
@@ -272,6 +272,9 @@ pub struct SessionManager {
     data_dir: PathBuf,
     home_dir: Option<PathBuf>,
     path_env: Option<OsString>,
+    proxy_https_hint: Option<OsString>,
+    proxy_http_hint: Option<OsString>,
+    session_name_override: Option<String>,
     local_proxy_port: u16,
     runner: Arc<dyn CommandRunner>,
     spawner: Arc<dyn TunnelSpawner>,
@@ -346,6 +349,9 @@ impl SessionManager {
             data_dir,
             home_dir,
             path_env,
+            proxy_https_hint: None,
+            proxy_http_hint: None,
+            session_name_override: None,
             local_proxy_port,
             runner,
             spawner,
@@ -357,6 +363,31 @@ impl SessionManager {
             has_managed_session,
             snapshot_tx,
         }
+    }
+
+    pub fn with_proxy_hints(
+        mut self,
+        https_proxy: Option<OsString>,
+        http_proxy: Option<OsString>,
+    ) -> Self {
+        self.proxy_https_hint = https_proxy;
+        self.proxy_http_hint = http_proxy;
+        self
+    }
+
+    pub fn with_session_name_override(mut self, name: String) -> Result<Self, CoreError> {
+        validate_session_name(&name)?;
+        self.session_name_override = Some(name);
+        Ok(self)
+    }
+
+    async fn resolve_colab_envs(&self) -> Vec<(String, String)> {
+        resolve_proxy_envs(
+            self.runner.as_ref(),
+            self.proxy_https_hint.as_deref(),
+            self.proxy_http_hint.as_deref(),
+        )
+        .await
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -472,6 +503,7 @@ impl SessionManager {
         };
 
         let _ = self.refresh_account_and_sessions(&colab_bin).await;
+        let proxy_envs = self.resolve_colab_envs().await;
 
         let pending: Option<PendingSession> = load_json_opt(&pending_session_path(&self.data_dir))
             .ok()
@@ -481,8 +513,14 @@ impl SessionManager {
             .flatten();
 
         if let Some(pend) = pending {
-            match colab_cli::status(self.runner.as_ref(), &colab_bin, &pend.session_name, None)
-                .await
+            match colab_cli::status(
+                self.runner.as_ref(),
+                &colab_bin,
+                &pend.session_name,
+                &proxy_envs,
+                None,
+            )
+            .await
             {
                 Ok(SessionStatusLookup::Present(entry)) => {
                     let promoted = ActiveSession {
@@ -548,7 +586,14 @@ impl SessionManager {
                 }
             }
 
-            match colab_cli::status(self.runner.as_ref(), &colab_bin, &act.session_name, None).await
+            match colab_cli::status(
+                self.runner.as_ref(),
+                &colab_bin,
+                &act.session_name,
+                &proxy_envs,
+                None,
+            )
+            .await
             {
                 Ok(SessionStatusLookup::Present(_)) => {
                     let mut guard = self.state.lock().await;
@@ -601,34 +646,37 @@ impl SessionManager {
     }
 
     async fn refresh_account_and_sessions(&self, colab_bin: &Path) -> Result<(), CoreError> {
-        let email = match colab_cli::whoami(self.runner.as_ref(), colab_bin, None).await {
-            Ok(email) => {
-                let mut guard = self.state.lock().await;
-                guard.account_email = Some(email.clone());
-                guard.auth_required = false;
-                email
-            }
-            Err(CoreError::AuthRequired { detail }) => {
-                let mut guard = self.state.lock().await;
-                guard.account_email = None;
-                guard.auth_required = true;
-                guard.last_error = Some(
-                    (&CoreError::AuthRequired {
-                        detail: detail.clone(),
-                    })
-                        .into(),
-                );
-                return Err(CoreError::AuthRequired { detail });
-            }
-            Err(err) => {
-                let mut guard = self.state.lock().await;
-                guard.last_error = Some((&err).into());
-                return Err(err);
-            }
-        };
+        let proxy_envs = self.resolve_colab_envs().await;
+        let email =
+            match colab_cli::whoami(self.runner.as_ref(), colab_bin, &proxy_envs, None).await {
+                Ok(email) => {
+                    let mut guard = self.state.lock().await;
+                    guard.account_email = Some(email.clone());
+                    guard.auth_required = false;
+                    email
+                }
+                Err(CoreError::AuthRequired { detail }) => {
+                    let mut guard = self.state.lock().await;
+                    guard.account_email = None;
+                    guard.auth_required = true;
+                    guard.last_error = Some(
+                        (&CoreError::AuthRequired {
+                            detail: detail.clone(),
+                        })
+                            .into(),
+                    );
+                    return Err(CoreError::AuthRequired { detail });
+                }
+                Err(err) => {
+                    let mut guard = self.state.lock().await;
+                    guard.last_error = Some((&err).into());
+                    return Err(err);
+                }
+            };
 
-        let usage_res = colab_cli::usage(self.runner.as_ref(), colab_bin, None).await;
-        let sessions_res = colab_cli::sessions(self.runner.as_ref(), colab_bin, None).await;
+        let usage_res = colab_cli::usage(self.runner.as_ref(), colab_bin, &proxy_envs, None).await;
+        let sessions_res =
+            colab_cli::sessions(self.runner.as_ref(), colab_bin, &proxy_envs, None).await;
 
         let mut guard = self.state.lock().await;
         guard.account_email = Some(email);
@@ -730,8 +778,11 @@ impl SessionManager {
         self.notify_snapshot();
 
         let cb = Some(self.make_line_callback());
-        let owner_email = colab_cli::whoami(self.runner.as_ref(), &colab_bin, cb.clone()).await?;
-        let usage = colab_cli::usage(self.runner.as_ref(), &colab_bin, cb.clone()).await?;
+        let proxy_envs = self.resolve_colab_envs().await;
+        let owner_email =
+            colab_cli::whoami(self.runner.as_ref(), &colab_bin, &proxy_envs, cb.clone()).await?;
+        let usage =
+            colab_cli::usage(self.runner.as_ref(), &colab_bin, &proxy_envs, cb.clone()).await?;
 
         {
             let mut guard = self.state.lock().await;
@@ -747,7 +798,10 @@ impl SessionManager {
             });
         }
 
-        let session_name = default_session_name_for_email(&owner_email);
+        let session_name = self
+            .session_name_override
+            .clone()
+            .unwrap_or_else(|| default_session_name_for_email(&owner_email));
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -756,9 +810,14 @@ impl SessionManager {
         // Phase 1 ledger + collision check inside state.lock
         let already_exists = {
             let _lock = StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await?;
-            let lookup =
-                colab_cli::status(self.runner.as_ref(), &colab_bin, &session_name, cb.clone())
-                    .await?;
+            let lookup = colab_cli::status(
+                self.runner.as_ref(),
+                &colab_bin,
+                &session_name,
+                &proxy_envs,
+                cb.clone(),
+            )
+            .await?;
             match lookup {
                 SessionStatusLookup::Present(entry) => Some(entry),
                 SessionStatusLookup::Missing => {
@@ -805,6 +864,7 @@ impl SessionManager {
                 &session_name,
                 gpu,
                 high_mem,
+                &proxy_envs,
                 cb.clone(),
             )
             .await;
@@ -813,12 +873,18 @@ impl SessionManager {
                 let _ = remove_if_exists(&pending_session_path(&self.data_dir));
                 let mut guard = self.state.lock().await;
                 guard.pending_session = None;
+                guard.sync_managed_flag();
                 return Err(err);
             }
 
-            let status_lookup =
-                colab_cli::status(self.runner.as_ref(), &colab_bin, &session_name, cb.clone())
-                    .await?;
+            let status_lookup = colab_cli::status(
+                self.runner.as_ref(),
+                &colab_bin,
+                &session_name,
+                &proxy_envs,
+                cb.clone(),
+            )
+            .await?;
             let entry = match status_lookup {
                 SessionStatusLookup::Present(e) => e,
                 SessionStatusLookup::Missing => {
@@ -839,12 +905,14 @@ impl SessionManager {
                     &session_name,
                     &owner_email,
                     Some(&entry.endpoint_sha256),
+                    &proxy_envs,
                     cb.clone(),
                 )
                 .await?;
                 let _ = remove_if_exists(&pending_session_path(&self.data_dir));
                 let mut guard = self.state.lock().await;
                 guard.pending_session = None;
+                guard.sync_managed_flag();
                 guard.last_stop_report = Some(report.clone());
                 guard.phase = SessionPhase::Idle;
                 guard.step = None;
@@ -930,12 +998,14 @@ impl SessionManager {
         self.notify_snapshot();
 
         let cb = Some(self.make_line_callback());
+        let proxy_envs = self.resolve_colab_envs().await;
         let started = start_master_and_verify(
             &self.data_dir,
             colab_bin,
             active,
             self.runner.as_ref(),
             self.spawner.as_ref(),
+            &proxy_envs,
             cb.clone(),
         )
         .await?;
@@ -1032,6 +1102,8 @@ impl SessionManager {
         let data_dir = self.data_dir.clone();
         let home_dir = self.home_dir.clone();
         let path_env = self.path_env.clone();
+        let proxy_https_hint = self.proxy_https_hint.clone();
+        let proxy_http_hint = self.proxy_http_hint.clone();
         let runner = self.runner.clone();
         let spawner = self.spawner.clone();
         let state = self.state.clone();
@@ -1071,6 +1143,12 @@ impl SessionManager {
                 let Some(active) = active else {
                     break;
                 };
+                let proxy_envs = resolve_proxy_envs(
+                    runner.as_ref(),
+                    proxy_https_hint.as_deref(),
+                    proxy_http_hint.as_deref(),
+                )
+                .await;
 
                 let mut reconnected = false;
                 for delay_secs in RECONNECT_BACKOFF_SECS {
@@ -1084,6 +1162,7 @@ impl SessionManager {
                         &active,
                         runner.as_ref(),
                         spawner.as_ref(),
+                        &proxy_envs,
                         None,
                     )
                     .await
@@ -1202,12 +1281,14 @@ impl SessionManager {
         };
 
         let cb = Some(self.make_line_callback());
+        let proxy_envs = self.resolve_colab_envs().await;
         let report = colab_cli::stop_and_verify(
             self.runner.as_ref(),
             &colab_bin,
             &session_name,
             &owner_email,
             endpoint_sha256.as_deref(),
+            &proxy_envs,
             cb,
         )
         .await?;
@@ -1257,13 +1338,22 @@ impl SessionManager {
         .ok_or_else(|| CoreError::SessionLedgerMismatch {
             detail: "没有活跃会话".to_string(),
         })?;
-        colab_cli::open_url(self.runner.as_ref(), &colab_bin, &session_name, None).await
+        let proxy_envs = self.resolve_colab_envs().await;
+        colab_cli::open_url(
+            self.runner.as_ref(),
+            &colab_bin,
+            &session_name,
+            &proxy_envs,
+            None,
+        )
+        .await
     }
 
     pub async fn open_colab_pay(&self) -> Result<(), CoreError> {
         let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
         let colab_bin = self.require_colab_bin(&env)?;
-        colab_cli::open_pay(self.runner.as_ref(), &colab_bin, None).await
+        let proxy_envs = self.resolve_colab_envs().await;
+        colab_cli::open_pay(self.runner.as_ref(), &colab_bin, &proxy_envs, None).await
     }
 
     /// Runs a command remotely over the active ControlMaster socket (used by live tests / probes).
@@ -1342,6 +1432,7 @@ mod tests {
             &self,
             _program: &Path,
             _args: &[String],
+            _envs: &[(String, String)],
         ) -> Result<Box<dyn TunnelProcess>, CoreError> {
             Ok(Box::new(MockProc))
         }
@@ -1368,6 +1459,13 @@ mod tests {
             _on_line: Option<LineCallback>,
         ) -> BoxFuture<'a, Result<CommandOutput, CoreError>> {
             Box::pin(async move {
+                if spec.program == Path::new(crate::locate::SCUTIL_BIN) {
+                    return Ok(CommandOutput::from_raw(
+                        Some(0),
+                        String::new(),
+                        String::new(),
+                    ));
+                }
                 self.calls.lock().unwrap().push(spec.args);
                 Ok(self
                     .queue
