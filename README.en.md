@@ -17,15 +17,19 @@
 
 ## Current state
 
-The project has only just been set up and **cannot be used yet**. The window shows the version and where the `colab` command was found on this Mac.
+Usable (**v0.2.0 Phase 1 MVP**):
 
-What is planned:
+- One-click launch: supports `L4` (`High-RAM` disabled), `T4`, `G4`, `A100`, and `H100`, with preflight `colab` auth and compute-unit balance checks (confirm prompt on 0 CU)
+- Zero-exposure local tunnel: single-slot SSH `ControlMaster` forwarding to a local Unix socket behind a `127.0.0.1:18188` `Host`/`Origin`-validated reverse proxy (no public tunnels, no `--enable-cors-header`)
+- Isolated dual windows: the `main` shell manages session lifecycle, live launch progress, and redacted logs (also persisted to `0600` `~/.colab-comfyui/app.log`), while the `canvas` window displays ComfyUI with zero Tauri IPC permissions
+- Billing safeguards: two-phase local session ledger (`~/.colab-comfyui/`), startup reconciliation, three-way exit confirmation, triple-verified stop reports, and a link to manage `[?]` orphan sessions
 
-- Start with one click: create the Colab session, mount Google Drive, install ComfyUI, and open the tunnel to this Mac
-- Show the remote ComfyUI interface in the app's window
-- Show the session state, GPU usage, compute unit balance and usage rate
-- Before stopping, export workflows, settings and outputs to Drive; after stopping, check that billing has stopped
-- Download models when they are needed
+Planned next:
+
+- Google Drive persistence, pre-stop export, and live GPU/compute-unit telemetry
+- `agy-cs` multi-account integration and sleep-aware idle watchdogs
+- Verified model/workflow catalog and automatic output gallery sync
+- On-demand vision prompt helper and fixed-port local API proxy
 
 ## Requirements
 
