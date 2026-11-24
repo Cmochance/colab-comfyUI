@@ -257,19 +257,7 @@ async fn stop_and_exit(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), UiError> {
-    if state.manager.has_running_or_pending_session().await {
-        let report = state
-            .manager
-            .stop_session()
-            .await
-            .map_err(|e| UiError::from(&e))?;
-        if !report.safe_to_clear_ledger {
-            return Err(UiError {
-                code: "STOP_UNVERIFIED".to_string(),
-                message: report.summary,
-            });
-        }
-    }
+    state.manager.stop_session_for_exit().await?;
     if let Some(canvas) = app.get_webview_window("canvas") {
         let _ = canvas.close();
     }

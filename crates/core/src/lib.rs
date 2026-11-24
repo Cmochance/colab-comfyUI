@@ -2082,6 +2082,65 @@ impl SessionManager {
         Ok(report)
     }
 
+    /// Stops active/pending sessions and rechecks all exit guards before allowing the desktop app to quit.
+    pub async fn stop_session_for_exit(&self) -> Result<(), UiError> {
+        let has_stoppable = self.start_in_flight.load(Ordering::SeqCst) || {
+            let guard = self.state.lock().await;
+            guard.active_session.is_some() || guard.pending_session.is_some()
+        };
+        if has_stoppable {
+            let report = self.stop_session().await.map_err(|e| UiError::from(&e))?;
+            if !report.safe_to_clear_ledger {
+                return Err(UiError {
+                    code: "STOP_UNVERIFIED".to_string(),
+                    message: report.summary,
+                });
+            }
+        }
+
+        let has_another_stoppable = {
+            let guard = self.state.lock().await;
+            guard.active_session.is_some() || guard.pending_session.is_some()
+        };
+        if has_another_stoppable {
+            let report2 = self.stop_session().await.map_err(|e| UiError::from(&e))?;
+            if !report2.safe_to_clear_ledger {
+                return Err(UiError {
+                    code: "STOP_UNVERIFIED".to_string(),
+                    message: report2.summary,
+                });
+            }
+        }
+
+        let disk = load_ledgers_checked(&self.data_dir);
+        if let Some(err) = disk.corruption_error {
+            Self::record_ui_error(&self.data_dir, &err);
+            {
+                let mut guard = self.state.lock().await;
+                guard.ledger_corrupted = true;
+                guard.active_session = disk.active;
+                guard.pending_session = disk.pending;
+                guard.phase = SessionPhase::Error;
+                guard.step = None;
+                guard.last_error = Some(err.clone());
+                guard.sync_managed_flag();
+            }
+            self.notify_snapshot();
+            return Err(err);
+        }
+
+        if disk.active.is_some()
+            || disk.pending.is_some()
+            || self.has_running_or_pending_session().await
+        {
+            return Err(UiError {
+                code: "STOP_UNVERIFIED".to_string(),
+                message: "本地仍存在未解除的会话保护记录，已阻止自动退出；请先核对状态或显式选择「保留云端运行，仅退出 App」。".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Closes local proxy + SSH ControlMaster on exit when the user explicitly
     /// chooses to keep the remote Colab GPU running.
     pub async fn disconnect_local_only_for_exit(&self) {
@@ -3277,9 +3336,10 @@ mod tests {
         assert!(snap_boot.active_session.is_some());
         assert_eq!(snap_boot.phase, SessionPhase::Error);
 
-        // Stop verifies & removes only active-session.json; corrupted pending-session.json stays untouched.
-        let report = block_on(mgr.stop_session()).unwrap();
-        assert!(report.safe_to_clear_ledger);
+        // Stop and Exit verifies & removes only active-session.json; corrupted pending-session.json stays
+        // untouched and blocks quitting until resolved.
+        let exit_err = block_on(mgr.stop_session_for_exit()).unwrap_err();
+        assert_eq!(exit_err.code, "SESSION_LEDGER_CORRUPTED");
         assert!(!active_session_path(&data).exists());
         assert!(pending_session_path(&data).exists());
 
@@ -3287,14 +3347,19 @@ mod tests {
         assert!(snap_after.active_session.is_none());
         assert!(snap_after.ledger_corrupted);
         assert_eq!(snap_after.phase, SessionPhase::Error);
+        assert!(snap_after
+            .last_stop_report
+            .as_ref()
+            .is_some_and(|r| r.safe_to_clear_ledger));
         assert!(mgr.has_running_or_pending_session_sync());
 
-        // Removing the corrupted file and reconciling restores Idle cleanly.
+        // Removing the corrupted file and reconciling restores Idle cleanly and allows exit.
         let _ = remove_if_exists(&pending_session_path(&data));
         let snap_clean = block_on(mgr.reconcile_on_startup());
         assert!(!snap_clean.ledger_corrupted);
         assert_eq!(snap_clean.phase, SessionPhase::Idle);
         assert!(!mgr.has_running_or_pending_session_sync());
+        block_on(mgr.stop_session_for_exit()).unwrap();
     }
 
     #[test]
