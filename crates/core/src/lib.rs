@@ -288,14 +288,30 @@ impl InnerState {
 struct LoadedLedgers {
     pending: Option<PendingSession>,
     active: Option<ActiveSession>,
+    pending_corrupted: bool,
+    active_corrupted: bool,
     corruption_error: Option<UiError>,
+}
+
+enum VerifiedLedgerTarget {
+    Active {
+        session_name: String,
+        owner_email: String,
+    },
+    Pending {
+        session_name: String,
+        owner_email: String,
+    },
 }
 
 fn load_ledgers_checked(data_dir: &Path) -> LoadedLedgers {
     let mut errors = Vec::new();
+    let mut pending_corrupted = false;
+    let mut active_corrupted = false;
     let pending = match load_json_opt::<PendingSession>(&pending_session_path(data_dir)) {
         Ok(v) => v,
         Err(err) => {
+            pending_corrupted = true;
             errors.push(format!("pending-session.json: {err}"));
             None
         }
@@ -303,6 +319,7 @@ fn load_ledgers_checked(data_dir: &Path) -> LoadedLedgers {
     let active = match load_json_opt::<ActiveSession>(&active_session_path(data_dir)) {
         Ok(v) => v,
         Err(err) => {
+            active_corrupted = true;
             errors.push(format!("active-session.json: {err}"));
             None
         }
@@ -317,6 +334,8 @@ fn load_ledgers_checked(data_dir: &Path) -> LoadedLedgers {
     LoadedLedgers {
         pending,
         active,
+        pending_corrupted,
+        active_corrupted,
         corruption_error,
     }
 }
@@ -629,6 +648,8 @@ impl SessionManager {
             Self::record_ui_error(&self.data_dir, err);
             let mut guard = self.state.lock().await;
             guard.ledger_corrupted = true;
+            guard.pending_session = ledgers.pending.clone();
+            guard.active_session = ledgers.active.clone();
             guard.phase = SessionPhase::Error;
             guard.last_error = Some(err.clone());
             guard.startup_notice = Some(StartupNotice {
@@ -643,14 +664,21 @@ impl SessionManager {
             return self.snapshot().await;
         } else {
             let mut guard = self.state.lock().await;
+            let was_corrupted = guard.ledger_corrupted;
             guard.ledger_corrupted = false;
             guard.pending_session = ledgers.pending.clone();
             guard.active_session = ledgers.active.clone();
+            if was_corrupted && ledgers.pending.is_none() && ledgers.active.is_none() {
+                guard.phase = SessionPhase::Idle;
+                guard.step = None;
+                guard.last_error = None;
+                guard.startup_notice = None;
+            }
             guard.sync_managed_flag();
         }
 
         if let Some(pend) = ledgers.pending {
-            let Ok(ref email) = account_res else {
+            let Ok((ref email, verified_orphan_count)) = account_res else {
                 let mut guard = self.state.lock().await;
                 guard.startup_notice = Some(StartupNotice {
                     kind: "reconcile_deferred".to_string(),
@@ -747,18 +775,53 @@ impl SessionManager {
                     }
                 }
                 Ok(SessionStatusLookup::Missing) => {
-                    let orphan_count = { self.state.lock().await.orphan_count };
-                    if pend.uncertain_orphan && orphan_count > 0 {
-                        let mut guard = self.state.lock().await;
-                        guard.warning_banner = Some(format!(
-                            "上次申请会话 {} 异常返回，且账号下存在 {} 个孤儿实例 [?]，已保留本地记录以防误关，请先前往 Colab 网页确认。",
-                            pend.session_name, orphan_count
-                        ));
+                    if pend.uncertain_orphan {
+                        match verified_orphan_count {
+                            Some(0) => {
+                                let _ = self
+                                    .clear_verified_ledger(VerifiedLedgerTarget::Pending {
+                                        session_name: pend.session_name.clone(),
+                                        owner_email: pend.owner_email.clone(),
+                                    })
+                                    .await;
+                                let mut guard = self.state.lock().await;
+                                guard.warning_banner = None;
+                                guard.startup_notice = Some(StartupNotice {
+                                    kind: "pending_gone".to_string(),
+                                    message: format!(
+                                        "上次未完成的开机记录 {} 在云端已不存在且已核验无孤儿实例，已清理本地残留记录。",
+                                        pend.session_name
+                                    ),
+                                    session_name: None,
+                                });
+                            }
+                            Some(orphan_count) => {
+                                let mut guard = self.state.lock().await;
+                                guard.warning_banner = Some(format!(
+                                    "上次申请会话 {} 异常返回，且账号下存在 {} 个孤儿实例 [?]，已保留本地记录以防误关，请先前往 Colab 网页确认。",
+                                    pend.session_name, orphan_count
+                                ));
+                            }
+                            None => {
+                                let mut guard = self.state.lock().await;
+                                guard.startup_notice = Some(StartupNotice {
+                                    kind: "reconcile_deferred".to_string(),
+                                    message: format!(
+                                        "上次申请会话 {} 异常返回且本次未能拉取实例列表核验是否存在孤儿实例 [?]，已保留本地记录与退出保护，请点击「重新对账」。",
+                                        pend.session_name
+                                    ),
+                                    session_name: Some(pend.session_name),
+                                });
+                            }
+                        }
                     } else {
-                        let _ = remove_if_exists(&pending_session_path(&self.data_dir));
+                        let _ = self
+                            .clear_verified_ledger(VerifiedLedgerTarget::Pending {
+                                session_name: pend.session_name.clone(),
+                                owner_email: pend.owner_email.clone(),
+                            })
+                            .await;
                         let mut guard = self.state.lock().await;
-                        guard.pending_session = None;
-                        guard.sync_managed_flag();
                         guard.startup_notice = Some(StartupNotice {
                             kind: "pending_gone".to_string(),
                             message: format!(
@@ -777,7 +840,7 @@ impl SessionManager {
                 }
             }
         } else if let Some(act) = ledgers.active {
-            let Ok(ref email) = account_res else {
+            let Ok((ref email, _)) = account_res else {
                 let mut guard = self.state.lock().await;
                 guard.startup_notice = Some(StartupNotice {
                     kind: "reconcile_deferred".to_string(),
@@ -828,10 +891,13 @@ impl SessionManager {
                     });
                 }
                 Ok(SessionStatusLookup::Missing) => {
-                    let _ = remove_if_exists(&active_session_path(&self.data_dir));
+                    let _ = self
+                        .clear_verified_ledger(VerifiedLedgerTarget::Active {
+                            session_name: act.session_name.clone(),
+                            owner_email: act.owner_email.clone(),
+                        })
+                        .await;
                     let mut guard = self.state.lock().await;
-                    guard.active_session = None;
-                    guard.sync_managed_flag();
                     guard.phase = SessionPhase::DisconnectedOrMissing;
                     guard.startup_notice = Some(StartupNotice {
                         kind: "active_gone".to_string(),
@@ -868,7 +934,10 @@ impl SessionManager {
         self.snapshot().await
     }
 
-    async fn refresh_account_and_sessions(&self, colab_bin: &Path) -> Result<String, CoreError> {
+    async fn refresh_account_and_sessions(
+        &self,
+        colab_bin: &Path,
+    ) -> Result<(String, Option<usize>), CoreError> {
         let proxy_envs = self.resolve_colab_envs().await;
         let email =
             match colab_cli::whoami(self.runner.as_ref(), colab_bin, &proxy_envs, None).await {
@@ -912,29 +981,105 @@ impl SessionManager {
                 guard.last_error = Some(ui_err);
             }
         }
-        if let Ok(list) = sessions_res {
-            guard.orphan_count = list.iter().filter(|s| s.is_orphan).count();
+        let verified_orphan_count = match sessions_res {
+            Ok(list) => {
+                let count = list.iter().filter(|s| s.is_orphan).count();
+                guard.orphan_count = count;
+                Some(count)
+            }
+            Err(err) => {
+                let ui_err = UiError::from(&err);
+                Self::record_ui_error(&self.data_dir, &ui_err);
+                guard.last_error = Some(ui_err);
+                None
+            }
+        };
+        Ok((email, verified_orphan_count))
+    }
+
+    async fn clear_verified_ledger(&self, target: VerifiedLedgerTarget) -> Result<(), CoreError> {
+        let _lock = StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await?;
+        let current = load_ledgers_checked(&self.data_dir);
+        match &target {
+            VerifiedLedgerTarget::Active {
+                session_name,
+                owner_email,
+            } => {
+                if !current.active_corrupted {
+                    let matches_active = current.active.as_ref().is_none_or(|a| {
+                        a.session_name == *session_name
+                            && a.owner_email.eq_ignore_ascii_case(owner_email)
+                    });
+                    if matches_active {
+                        remove_if_exists(&active_session_path(&self.data_dir))?;
+                    }
+                }
+                if !current.pending_corrupted {
+                    if let Some(ref pend) = current.pending {
+                        if !pend.uncertain_orphan
+                            && pend.session_name == *session_name
+                            && pend.owner_email.eq_ignore_ascii_case(owner_email)
+                        {
+                            remove_if_exists(&pending_session_path(&self.data_dir))?;
+                        }
+                    }
+                }
+            }
+            VerifiedLedgerTarget::Pending {
+                session_name,
+                owner_email,
+            } => {
+                if !current.pending_corrupted {
+                    let matches_pending = current.pending.as_ref().is_none_or(|p| {
+                        p.session_name == *session_name
+                            && p.owner_email.eq_ignore_ascii_case(owner_email)
+                    });
+                    if matches_pending {
+                        remove_if_exists(&pending_session_path(&self.data_dir))?;
+                    }
+                }
+            }
         }
-        Ok(email)
+
+        let after = load_ledgers_checked(&self.data_dir);
+        let mut guard = self.state.lock().await;
+        guard.active_session = after.active;
+        guard.pending_session = after.pending;
+        guard.ledger_corrupted = after.corruption_error.is_some();
+        if let Some(err) = after.corruption_error {
+            guard.phase = SessionPhase::Error;
+            guard.step = None;
+            guard.last_error = Some(err);
+        } else if guard.active_session.is_none() && guard.pending_session.is_none() {
+            guard.phase = SessionPhase::Idle;
+            guard.step = None;
+        }
+        guard.sync_managed_flag();
+        Ok(())
     }
 
     pub async fn cancel_start(&self) -> AppSnapshot {
+        if !self.start_in_flight.load(Ordering::SeqCst) {
+            return self.snapshot().await;
+        }
         self.cancel_requested.store(true, Ordering::SeqCst);
-        let _ = self.cancel_tx.send(true);
+        self.cancel_tx.send_replace(true);
         self.push_log(
             "已请求取消开机：若正在等待 GPU 分配将待其返回后停机；若已在建隧道或部署则立即中断并停机核验。"
                 .to_string(),
         )
         .await;
         if let Ok(_lock) = StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await {
-            if let Ok(Some(mut pend)) =
-                load_json_opt::<PendingSession>(&pending_session_path(&self.data_dir))
-            {
-                pend.cancel_requested = true;
-                let _ = save_json_0600(&pending_session_path(&self.data_dir), &pend);
-                let mut guard = self.state.lock().await;
-                guard.pending_session = Some(pend);
-                guard.sync_managed_flag();
+            if !load_ledgers_checked(&self.data_dir).pending_corrupted {
+                if let Ok(Some(mut pend)) =
+                    load_json_opt::<PendingSession>(&pending_session_path(&self.data_dir))
+                {
+                    pend.cancel_requested = true;
+                    let _ = save_json_0600(&pending_session_path(&self.data_dir), &pend);
+                    let mut guard = self.state.lock().await;
+                    guard.pending_session = Some(pend);
+                    guard.sync_managed_flag();
+                }
             }
         }
         self.notify_snapshot();
@@ -955,7 +1100,7 @@ impl SessionManager {
             return Err(CoreError::StartInProgress);
         }
         self.cancel_requested.store(false, Ordering::SeqCst);
-        let _ = self.cancel_tx.send(false);
+        self.cancel_tx.send_replace(false);
         self.intentional_stop.store(false, Ordering::SeqCst);
 
         let res = self
@@ -972,7 +1117,9 @@ impl SessionManager {
                     guard.step = None;
                 }
                 CoreError::StartCancelledAfterAllocation { .. }
-                    if guard.active_session.is_none() && guard.pending_session.is_none() =>
+                    if guard.active_session.is_none()
+                        && guard.pending_session.is_none()
+                        && !guard.ledger_corrupted =>
                 {
                     let ui_err = UiError::from(err);
                     Self::record_ui_error(&self.data_dir, &ui_err);
@@ -993,6 +1140,7 @@ impl SessionManager {
         res
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn cancel_allocated_session(
         &self,
         colab_bin: &Path,
@@ -1001,7 +1149,17 @@ impl SessionManager {
         endpoint_sha256: &str,
         proxy_envs: &[(String, String)],
         cb: Option<LineCallback>,
+        prior_ledger_err: Option<CoreError>,
+        target: VerifiedLedgerTarget,
     ) -> Result<AppSnapshot, CoreError> {
+        if let Some(ref err) = prior_ledger_err {
+            let ui_err = UiError::from(err);
+            Self::record_ui_error(&self.data_dir, &ui_err);
+            self.push_log(format!(
+                "本地活跃账本写入失败（已继续执行云端停机核验）：{err}"
+            ))
+            .await;
+        }
         self.push_log("收到取消开机请求，立即执行停机与计费核验...".to_string())
             .await;
         let report = colab_cli::stop_and_verify(
@@ -1015,17 +1173,23 @@ impl SessionManager {
         )
         .await?;
 
+        let mut clear_err_note: Option<String> = None;
         if report.safe_to_clear_ledger {
-            let _lock = StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await?;
-            let _ = remove_if_exists(&active_session_path(&self.data_dir));
-            let _ = remove_if_exists(&pending_session_path(&self.data_dir));
+            if let Err(err) = self.clear_verified_ledger(target).await {
+                let ui_err = UiError::from(&err);
+                Self::record_ui_error(&self.data_dir, &ui_err);
+                clear_err_note = Some(err.to_string());
+            }
         }
 
         {
             let mut guard = self.state.lock().await;
-            if report.safe_to_clear_ledger {
-                guard.active_session = None;
-                guard.pending_session = None;
+            if report.safe_to_clear_ledger
+                && clear_err_note.is_none()
+                && guard.active_session.is_none()
+                && guard.pending_session.is_none()
+                && !guard.ledger_corrupted
+            {
                 guard.phase = SessionPhase::Idle;
                 guard.step = None;
             } else {
@@ -1036,10 +1200,18 @@ impl SessionManager {
             guard.last_stop_report = Some(report.clone());
         }
 
+        let mut detail = report.summary;
+        if let Some(err) = prior_ledger_err {
+            detail = format!("{detail}（账本晋升写入失败：{err}）");
+        }
+        if let Some(err) = clear_err_note {
+            detail = format!("{detail}（清理本地账本失败：{err}）");
+        }
+
         Err(CoreError::StartCancelledAfterAllocation {
             session_name: session_name.to_string(),
             stop_verified: report.billing_verified_stopped,
-            detail: report.summary,
+            detail,
         })
     }
 
@@ -1049,6 +1221,12 @@ impl SessionManager {
         high_mem: bool,
         allow_zero_balance: bool,
     ) -> Result<AppSnapshot, CoreError> {
+        let ledgers = load_ledgers_checked(&self.data_dir);
+        if let Some(err) = ledgers.corruption_error {
+            return Err(CoreError::SessionLedgerCorrupted {
+                detail: err.message,
+            });
+        }
         let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
         let colab_bin = self.require_colab_bin(&env)?;
         if !env.ssh_available {
@@ -1137,6 +1315,13 @@ impl SessionManager {
                                     .map(|s| s.endpoint_sha256)
                                     .collect::<HashSet<String>>()
                             });
+                    if self.cancel_requested.load(Ordering::SeqCst) {
+                        return Err(CoreError::StartCancelledAfterAllocation {
+                            session_name,
+                            stop_verified: true,
+                            detail: "尚未申请云端实例即已取消。".to_string(),
+                        });
+                    }
                     let pend = PendingSession {
                         session_name: session_name.clone(),
                         owner_email: owner_email.clone(),
@@ -1163,6 +1348,19 @@ impl SessionManager {
             .await;
             existing
         } else {
+            if self.cancel_requested.load(Ordering::SeqCst) {
+                let _ = self
+                    .clear_verified_ledger(VerifiedLedgerTarget::Pending {
+                        session_name: session_name.clone(),
+                        owner_email: owner_email.clone(),
+                    })
+                    .await;
+                return Err(CoreError::StartCancelledAfterAllocation {
+                    session_name,
+                    stop_verified: true,
+                    detail: "尚未申请云端实例即已取消。".to_string(),
+                });
+            }
             {
                 let mut guard = self.state.lock().await;
                 guard.step = Some(StartStep::CreatingSession);
@@ -1217,14 +1415,28 @@ impl SessionManager {
                         local_port: self.local_proxy_port,
                         created_at_unix: now_unix,
                     };
-                    if let Ok(_lock) = StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await {
-                        if save_json_0600(&active_session_path(&self.data_dir), &promoted).is_ok() {
-                            let _ = remove_if_exists(&pending_session_path(&self.data_dir));
-                        }
-                    }
+                    let promotion_err: Option<CoreError> =
+                        match StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await {
+                            Ok(_lock) => {
+                                match save_json_0600(
+                                    &active_session_path(&self.data_dir),
+                                    &promoted,
+                                ) {
+                                    Ok(()) => {
+                                        let _ =
+                                            remove_if_exists(&pending_session_path(&self.data_dir));
+                                        None
+                                    }
+                                    Err(err) => Some(err),
+                                }
+                            }
+                            Err(err) => Some(err),
+                        };
                     {
                         let mut guard = self.state.lock().await;
-                        guard.pending_session = None;
+                        if promotion_err.is_none() {
+                            guard.pending_session = None;
+                        }
                         guard.active_session = Some(promoted);
                         guard.sync_managed_flag();
                     }
@@ -1237,6 +1449,11 @@ impl SessionManager {
                                 &alive_entry.endpoint_sha256,
                                 &proxy_envs,
                                 cb,
+                                promotion_err,
+                                VerifiedLedgerTarget::Active {
+                                    session_name: session_name.clone(),
+                                    owner_email: owner_email.clone(),
+                                },
                             )
                             .await;
                     }
@@ -1321,7 +1538,8 @@ impl SessionManager {
             }
         };
 
-        // Promote pending -> active BEFORE checking cancel so H3 always keeps active ledger if stop fails.
+        // Promote pending -> active BEFORE checking cancel so H3 always keeps a managed ledger if stop fails,
+        // without letting a disk-write error skip stopping the just-allocated GPU (D3).
         let active = ActiveSession {
             session_name: session_name.clone(),
             owner_email: owner_email.clone(),
@@ -1332,14 +1550,22 @@ impl SessionManager {
             local_port: self.local_proxy_port,
             created_at_unix: now_unix,
         };
-        {
-            let _lock = StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await?;
-            save_json_0600(&active_session_path(&self.data_dir), &active)?;
-            remove_if_exists(&pending_session_path(&self.data_dir))?;
-        }
+        let promotion_err: Option<CoreError> =
+            match StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await {
+                Ok(_lock) => match save_json_0600(&active_session_path(&self.data_dir), &active) {
+                    Ok(()) => {
+                        let _ = remove_if_exists(&pending_session_path(&self.data_dir));
+                        None
+                    }
+                    Err(err) => Some(err),
+                },
+                Err(err) => Some(err),
+            };
         {
             let mut guard = self.state.lock().await;
-            guard.pending_session = None;
+            if promotion_err.is_none() {
+                guard.pending_session = None;
+            }
             guard.active_session = Some(active.clone());
             guard.sync_managed_flag();
         }
@@ -1354,8 +1580,16 @@ impl SessionManager {
                     &entry.endpoint_sha256,
                     &proxy_envs,
                     cb,
+                    promotion_err,
+                    VerifiedLedgerTarget::Active {
+                        session_name: session_name.clone(),
+                        owner_email: owner_email.clone(),
+                    },
                 )
                 .await;
+        }
+        if let Some(err) = promotion_err {
+            return Err(err);
         }
 
         let cancel_rx = self.cancel_tx.subscribe();
@@ -1373,6 +1607,11 @@ impl SessionManager {
                         &entry.endpoint_sha256,
                         &proxy_envs,
                         cb,
+                        None,
+                        VerifiedLedgerTarget::Active {
+                            session_name: session_name.clone(),
+                            owner_email: owner_email.clone(),
+                        },
                     )
                     .await;
             }
@@ -1775,16 +2014,28 @@ impl SessionManager {
         let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
         let colab_bin = self.require_colab_bin(&env)?;
 
-        let (session_name, owner_email, endpoint_sha256) = {
+        let (session_name, owner_email, endpoint_sha256, target) = {
             let guard = self.state.lock().await;
             if let Some(ref act) = guard.active_session {
                 (
                     act.session_name.clone(),
                     act.owner_email.clone(),
                     Some(act.endpoint_sha256.clone()),
+                    VerifiedLedgerTarget::Active {
+                        session_name: act.session_name.clone(),
+                        owner_email: act.owner_email.clone(),
+                    },
                 )
             } else if let Some(ref pend) = guard.pending_session {
-                (pend.session_name.clone(), pend.owner_email.clone(), None)
+                (
+                    pend.session_name.clone(),
+                    pend.owner_email.clone(),
+                    None,
+                    VerifiedLedgerTarget::Pending {
+                        session_name: pend.session_name.clone(),
+                        owner_email: pend.owner_email.clone(),
+                    },
+                )
             } else {
                 return Err(CoreError::SessionLedgerMismatch {
                     detail: "当前没有可停机的会话".to_string(),
@@ -1815,22 +2066,13 @@ impl SessionManager {
         .await?;
 
         if report.safe_to_clear_ledger {
-            let _lock = StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await?;
-            let _ = remove_if_exists(&active_session_path(&self.data_dir));
-            let _ = remove_if_exists(&pending_session_path(&self.data_dir));
-        }
-
-        {
+            self.clear_verified_ledger(target).await?;
             let mut guard = self.state.lock().await;
-            if report.safe_to_clear_ledger {
-                guard.active_session = None;
-                guard.pending_session = None;
-                guard.ledger_corrupted = false;
-                guard.phase = SessionPhase::Idle;
-                guard.step = None;
-            } else {
-                guard.phase = SessionPhase::Error;
-            }
+            guard.usage = report.usage.clone();
+            guard.last_stop_report = Some(report.clone());
+        } else {
+            let mut guard = self.state.lock().await;
+            guard.phase = SessionPhase::Error;
             guard.sync_managed_flag();
             guard.usage = report.usage.clone();
             guard.last_stop_report = Some(report.clone());
@@ -2622,5 +2864,532 @@ mod tests {
         assert_eq!(snap.phase, SessionPhase::DisconnectedOrMissing);
         assert!(snap.step.is_none());
         assert!(snap.last_error.is_some());
+    }
+
+    #[test]
+    fn cancel_tunnel_then_second_start_succeeds_without_stale_cancel() {
+        let tmp = ShortTempDir::new();
+        let home = tmp.0.join("h");
+        let data = tmp.0.join("d");
+        install_fake_colab(&home);
+        let sname = default_session_name_for_email("alice@example.com");
+        let second_attempt = Arc::new(AtomicBool::new(false));
+        let second_flag = second_attempt.clone();
+        let boot_entered = Arc::new(tokio::sync::Notify::new());
+        let boot_entered_srv = boot_entered.clone();
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let stop_calls_srv = stop_calls.clone();
+
+        let runner = Arc::new(SmartRunner {
+            responder: Box::new(move |spec| {
+                let sname = sname.clone();
+                let second_flag = second_flag.clone();
+                let boot_entered_srv = boot_entered_srv.clone();
+                let stop_calls_srv = stop_calls_srv.clone();
+                let prog = spec.program.clone();
+                let args = spec.args.clone();
+                Box::pin(async move {
+                    if prog == Path::new(crate::locate::SCUTIL_BIN)
+                        || prog == Path::new(crate::locate::SSH_KEYGEN_BIN)
+                    {
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    if prog == Path::new(crate::locate::SSH_BIN) {
+                        if args.iter().any(|a| a == "bash -s") {
+                            if !second_flag.load(Ordering::SeqCst) {
+                                boot_entered_srv.notify_one();
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                            }
+                            return Ok(CommandOutput::from_raw(
+                                Some(0),
+                                format!("{}\n", crate::bootstrap::COMFY_READY_SENTINEL),
+                                String::new(),
+                            ));
+                        }
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let sub = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .map(String::as_str);
+                    let out = match sub {
+                        Some("whoami") => "Email: alice@example.com\n".to_string(),
+                        Some("usage") => "Current balance: 10.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0".to_string(),
+                        Some("status") => format!("[{sname}] m-s-d1 | Hardware: NVIDIA T4 | Shape: Standard | Variant: GPU"),
+                        Some("sessions") => {
+                            if stop_calls_srv.load(Ordering::SeqCst) > 0 && !second_flag.load(Ordering::SeqCst) {
+                                "[colab] No active sessions found on server.".to_string()
+                            } else {
+                                format!("[{sname}] m-s-d1 | Hardware: NVIDIA T4 | Shape: Standard | Variant: GPU")
+                            }
+                        }
+                        Some("stop") => {
+                            stop_calls_srv.fetch_add(1, Ordering::SeqCst);
+                            "[colab] Session terminated.".to_string()
+                        }
+                        _ => String::new(),
+                    };
+                    Ok(CommandOutput::from_raw(Some(0), out, String::new()))
+                })
+            }),
+        });
+
+        let mgr = Arc::new(SessionManager::with_deps(
+            data.clone(),
+            Some(home),
+            Some(OsString::from("/usr/bin:/bin")),
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        ));
+        fs::write(crate::config::ssh_key_path(&data), "priv").unwrap();
+        fs::write(crate::config::ssh_pub_key_path(&data), "pub").unwrap();
+
+        block_on(async {
+            let mgr_start = mgr.clone();
+            let handle =
+                tokio::spawn(
+                    async move { mgr_start.start_session(GpuTier::T4, false, false).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), boot_entered.notified())
+                .await
+                .unwrap();
+            let _ = mgr.cancel_start().await;
+            let err = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                CoreError::StartCancelledAfterAllocation {
+                    stop_verified: true,
+                    ..
+                }
+            ));
+            assert_eq!(mgr.snapshot().await.phase, SessionPhase::Idle);
+
+            // Second start without clicking cancel must clear stale watch cancel state via send_replace.
+            second_attempt.store(true, Ordering::SeqCst);
+            let snap2 = tokio::time::timeout(
+                Duration::from_secs(5),
+                mgr.start_session(GpuTier::T4, false, false),
+            )
+            .await
+            .unwrap()
+            .expect("second start must not see stale cancel=true");
+            assert_eq!(snap2.phase, SessionPhase::Ready);
+            assert!(snap2.tunnel_connected);
+        });
+    }
+
+    #[test]
+    fn reconcile_preserves_uncertain_orphan_pending_when_sessions_query_fails() {
+        let tmp = ShortTempDir::new();
+        let home = tmp.0.join("h");
+        let data = tmp.0.join("d");
+        install_fake_colab(&home);
+        let sname = default_session_name_for_email("alice@example.com");
+        save_json_0600(
+            &pending_session_path(&data),
+            &PendingSession {
+                session_name: sname.clone(),
+                owner_email: "alice@example.com".to_string(),
+                gpu: GpuTier::L4,
+                high_mem: false,
+                cancel_requested: false,
+                uncertain_orphan: true,
+                created_at_unix: 100,
+            },
+        )
+        .unwrap();
+
+        let sessions_fail = Arc::new(AtomicBool::new(true));
+        let sf = sessions_fail.clone();
+        let runner = Arc::new(SmartRunner {
+            responder: Box::new(move |spec| {
+                let sname = sname.clone();
+                let sf = sf.clone();
+                let prog = spec.program.clone();
+                let args = spec.args.clone();
+                Box::pin(async move {
+                    if prog == Path::new(crate::locate::SCUTIL_BIN) {
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let sub = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .map(String::as_str);
+                    match sub {
+                        Some("whoami") => Ok(CommandOutput::from_raw(
+                            Some(0),
+                            "Email: alice@example.com\n".to_string(),
+                            String::new(),
+                        )),
+                        Some("usage") => Ok(CommandOutput::from_raw(
+                            Some(0),
+                            "Current balance: 10.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0".to_string(),
+                            String::new(),
+                        )),
+                        Some("sessions") => {
+                            if sf.load(Ordering::SeqCst) {
+                                Ok(CommandOutput::from_raw(
+                                    Some(1),
+                                    String::new(),
+                                    "network unreachable".to_string(),
+                                ))
+                            } else {
+                                Ok(CommandOutput::from_raw(
+                                    Some(0),
+                                    "[colab] No active sessions found on server.".to_string(),
+                                    String::new(),
+                                ))
+                            }
+                        }
+                        Some("status") => Ok(CommandOutput::from_raw(
+                            Some(0),
+                            format!("[colab] Session '{sname}' not found."),
+                            String::new(),
+                        )),
+                        _ => Ok(CommandOutput::from_raw(Some(0), String::new(), String::new())),
+                    }
+                })
+            }),
+        });
+
+        let mgr = SessionManager::with_deps(
+            data.clone(),
+            Some(home),
+            Some(OsString::from("/usr/bin:/bin")),
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        );
+
+        let snap1 = block_on(mgr.reconcile_on_startup());
+        assert!(pending_session_path(&data).exists());
+        assert!(snap1.pending_session.is_some());
+        assert!(mgr.has_running_or_pending_session_sync());
+        assert_eq!(
+            snap1.startup_notice.as_ref().map(|n| n.kind.as_str()),
+            Some("reconcile_deferred")
+        );
+
+        // Once sessions succeeds cleanly with 0 orphans, pending ledger can be cleared.
+        sessions_fail.store(false, Ordering::SeqCst);
+        let snap2 = block_on(mgr.reconcile_on_startup());
+        assert!(!pending_session_path(&data).exists());
+        assert!(snap2.pending_session.is_none());
+        assert!(!mgr.has_running_or_pending_session_sync());
+        assert_eq!(
+            snap2.startup_notice.as_ref().map(|n| n.kind.as_str()),
+            Some("pending_gone")
+        );
+    }
+
+    #[test]
+    fn allocated_session_still_stops_on_cancel_when_active_promotion_fails() {
+        let tmp = ShortTempDir::new();
+        let home = tmp.0.join("h");
+        let data = tmp.0.join("d");
+        install_fake_colab(&home);
+        let sname = default_session_name_for_email("alice@example.com");
+        let new_entered = Arc::new(tokio::sync::Notify::new());
+        let new_entered_srv = new_entered.clone();
+        let allow_new_finish = Arc::new(tokio::sync::Notify::new());
+        let allow_new_finish_srv = allow_new_finish.clone();
+        let stop_called = Arc::new(AtomicBool::new(false));
+        let stop_called_srv = stop_called.clone();
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let status_calls_srv = status_calls.clone();
+
+        let runner = Arc::new(SmartRunner {
+            responder: Box::new(move |spec| {
+                let sname = sname.clone();
+                let new_entered_srv = new_entered_srv.clone();
+                let allow_new_finish_srv = allow_new_finish_srv.clone();
+                let stop_called_srv = stop_called_srv.clone();
+                let status_calls_srv = status_calls_srv.clone();
+                let prog = spec.program.clone();
+                let args = spec.args.clone();
+                Box::pin(async move {
+                    if prog == Path::new(crate::locate::SCUTIL_BIN)
+                        || prog == Path::new(crate::locate::SSH_KEYGEN_BIN)
+                    {
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let sub = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .map(String::as_str);
+                    let out = match sub {
+                        Some("whoami") => "Email: alice@example.com\n".to_string(),
+                        Some("usage") => "Current balance: 10.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0".to_string(),
+                        Some("status") => {
+                            let idx = status_calls_srv.fetch_add(1, Ordering::SeqCst);
+                            if idx == 0 {
+                                format!("[colab] Session '{sname}' not found.")
+                            } else {
+                                format!("[{sname}] m-s-d3 | Hardware: NVIDIA T4 | Shape: Standard | Variant: GPU")
+                            }
+                        }
+                        Some("sessions") => {
+                            "[colab] No active sessions found on server.".to_string()
+                        }
+                        Some("new") => {
+                            new_entered_srv.notify_one();
+                            allow_new_finish_srv.notified().await;
+                            format!("[{sname}] m-s-d3 | Hardware: NVIDIA T4 | Shape: Standard | Variant: GPU")
+                        }
+                        Some("stop") => {
+                            stop_called_srv.store(true, Ordering::SeqCst);
+                            "[colab] Session terminated.".to_string()
+                        }
+                        _ => String::new(),
+                    };
+                    Ok(CommandOutput::from_raw(Some(0), out, String::new()))
+                })
+            }),
+        });
+
+        let mgr = Arc::new(SessionManager::with_deps(
+            data.clone(),
+            Some(home),
+            Some(OsString::from("/usr/bin:/bin")),
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        ));
+
+        block_on(async {
+            let mgr_start = mgr.clone();
+            let handle =
+                tokio::spawn(
+                    async move { mgr_start.start_session(GpuTier::T4, false, false).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), new_entered.notified())
+                .await
+                .unwrap();
+
+            // Sabotage active-session.json path as a directory so save_json_0600 fails on promote.
+            fs::create_dir_all(active_session_path(&data)).unwrap();
+            let _ = mgr.cancel_start().await;
+            allow_new_finish.notify_one();
+
+            let err = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(stop_called.load(Ordering::SeqCst));
+            assert!(matches!(
+                err,
+                CoreError::StartCancelledAfterAllocation {
+                    stop_verified: true,
+                    ..
+                }
+            ));
+            assert!(!pending_session_path(&data).exists());
+            let _ = fs::remove_dir_all(active_session_path(&data));
+        });
+    }
+
+    #[test]
+    fn stop_verified_active_preserves_corrupted_pending_ledger() {
+        let tmp = ShortTempDir::new();
+        let home = tmp.0.join("h");
+        let data = tmp.0.join("d");
+        install_fake_colab(&home);
+        let sname = default_session_name_for_email("alice@example.com");
+
+        save_json_0600(
+            &active_session_path(&data),
+            &ActiveSession {
+                session_name: sname.clone(),
+                owner_email: "alice@example.com".to_string(),
+                endpoint_sha256: sha256_hex(b"m-s-d5"),
+                gpu: GpuTier::T4,
+                high_mem: false,
+                hardware_summary: "NVIDIA T4".to_string(),
+                local_port: LOCAL_PROXY_PORT,
+                created_at_unix: 100,
+            },
+        )
+        .unwrap();
+        fs::write(pending_session_path(&data), b"{corrupted pending json").unwrap();
+
+        let runner = Arc::new(SmartRunner {
+            responder: Box::new(move |spec| {
+                let sname = sname.clone();
+                let prog = spec.program.clone();
+                let args = spec.args.clone();
+                Box::pin(async move {
+                    if prog == Path::new(crate::locate::SCUTIL_BIN) {
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let sub = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .map(String::as_str);
+                    let out = match sub {
+                        Some("whoami") => "Email: alice@example.com\n".to_string(),
+                        Some("usage") => "Current balance: 10.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0".to_string(),
+                        Some("status") => format!("[colab] Session '{sname}' not found."),
+                        Some("sessions") => "[colab] No active sessions found on server.".to_string(),
+                        _ => String::new(),
+                    };
+                    Ok(CommandOutput::from_raw(Some(0), out, String::new()))
+                })
+            }),
+        });
+
+        let mgr = SessionManager::with_deps(
+            data.clone(),
+            Some(home),
+            Some(OsString::from("/usr/bin:/bin")),
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        );
+
+        let snap_boot = block_on(mgr.reconcile_on_startup());
+        assert!(snap_boot.ledger_corrupted);
+        assert!(snap_boot.active_session.is_some());
+        assert_eq!(snap_boot.phase, SessionPhase::Error);
+
+        // Stop verifies & removes only active-session.json; corrupted pending-session.json stays untouched.
+        let report = block_on(mgr.stop_session()).unwrap();
+        assert!(report.safe_to_clear_ledger);
+        assert!(!active_session_path(&data).exists());
+        assert!(pending_session_path(&data).exists());
+
+        let snap_after = block_on(mgr.snapshot());
+        assert!(snap_after.active_session.is_none());
+        assert!(snap_after.ledger_corrupted);
+        assert_eq!(snap_after.phase, SessionPhase::Error);
+        assert!(mgr.has_running_or_pending_session_sync());
+
+        // Removing the corrupted file and reconciling restores Idle cleanly.
+        let _ = remove_if_exists(&pending_session_path(&data));
+        let snap_clean = block_on(mgr.reconcile_on_startup());
+        assert!(!snap_clean.ledger_corrupted);
+        assert_eq!(snap_clean.phase, SessionPhase::Idle);
+        assert!(!mgr.has_running_or_pending_session_sync());
+    }
+
+    #[test]
+    fn cancel_during_baseline_sessions_skips_colab_new() {
+        let tmp = ShortTempDir::new();
+        let home = tmp.0.join("h");
+        let data = tmp.0.join("d");
+        install_fake_colab(&home);
+        let sname = default_session_name_for_email("alice@example.com");
+        let sessions_entered = Arc::new(tokio::sync::Notify::new());
+        let sessions_entered_srv = sessions_entered.clone();
+        let allow_sessions_finish = Arc::new(tokio::sync::Notify::new());
+        let allow_sessions_finish_srv = allow_sessions_finish.clone();
+        let new_called = Arc::new(AtomicBool::new(false));
+        let new_called_srv = new_called.clone();
+
+        let runner = Arc::new(SmartRunner {
+            responder: Box::new(move |spec| {
+                let sname = sname.clone();
+                let sessions_entered_srv = sessions_entered_srv.clone();
+                let allow_sessions_finish_srv = allow_sessions_finish_srv.clone();
+                let new_called_srv = new_called_srv.clone();
+                let prog = spec.program.clone();
+                let args = spec.args.clone();
+                Box::pin(async move {
+                    if prog == Path::new(crate::locate::SCUTIL_BIN)
+                        || prog == Path::new(crate::locate::SSH_KEYGEN_BIN)
+                    {
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let sub = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .map(String::as_str);
+                    let out = match sub {
+                        Some("whoami") => "Email: alice@example.com\n".to_string(),
+                        Some("usage") => "Current balance: 10.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0".to_string(),
+                        Some("status") => format!("[colab] Session '{sname}' not found."),
+                        Some("sessions") => {
+                            sessions_entered_srv.notify_one();
+                            allow_sessions_finish_srv.notified().await;
+                            "[colab] No active sessions found on server.".to_string()
+                        }
+                        Some("new") => {
+                            new_called_srv.store(true, Ordering::SeqCst);
+                            String::new()
+                        }
+                        _ => String::new(),
+                    };
+                    Ok(CommandOutput::from_raw(Some(0), out, String::new()))
+                })
+            }),
+        });
+
+        let mgr = Arc::new(SessionManager::with_deps(
+            data.clone(),
+            Some(home),
+            Some(OsString::from("/usr/bin:/bin")),
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        ));
+
+        block_on(async {
+            let mgr_start = mgr.clone();
+            let handle =
+                tokio::spawn(
+                    async move { mgr_start.start_session(GpuTier::T4, false, false).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), sessions_entered.notified())
+                .await
+                .unwrap();
+
+            let _ = mgr.cancel_start().await;
+            allow_sessions_finish.notify_one();
+
+            let err = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(!new_called.load(Ordering::SeqCst));
+            assert!(!pending_session_path(&data).exists());
+            assert!(matches!(
+                err,
+                CoreError::StartCancelledAfterAllocation {
+                    stop_verified: true,
+                    ..
+                }
+            ));
+            assert_eq!(mgr.snapshot().await.phase, SessionPhase::Idle);
+        });
     }
 }

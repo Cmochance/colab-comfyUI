@@ -68,9 +68,96 @@ pip_install_req() {{
 }}
 
 need_start=true
+takeover_state="NONE"
 if curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
   echo "=== [bootstrap] Existing ComfyUI detected; auditing launch flags ==="
   takeover_state="$(python3 - "${{COMFY_PORT}}" <<'PY'
+import glob, json, os, sys, urllib.request
+
+port = int(sys.argv[1])
+port_hex = f":{{port:04X}}"
+listen_inodes = set()
+for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        with open(proc_net, "r", encoding="utf-8", errors="replace") as f:
+            next(f, None)
+            for line in f:
+                cols = line.split()
+                if len(cols) >= 10 and cols[3] == "0A" and cols[1].upper().endswith(port_hex):
+                    listen_inodes.add(f"socket:[{{cols[9]}}]")
+    except OSError:
+        continue
+
+unsafe_pids = []
+for pid_dir in glob.glob("/proc/[0-9]*"):
+    try:
+        int(os.path.basename(pid_dir))
+    except ValueError:
+        continue
+    if listen_inodes:
+        owns_port = False
+        for fd_path in glob.glob(f"{{pid_dir}}/fd/*"):
+            try:
+                if os.readlink(fd_path) in listen_inodes:
+                    owns_port = True
+                    break
+            except OSError:
+                continue
+        if not owns_port:
+            continue
+    try:
+        with open(f"{{pid_dir}}/cmdline", "rb") as f:
+            raw = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        continue
+    args = [a for a in raw.split("\x00") if a]
+    if any("main.py" in a for a in args) and "--enable-cors-header" in args:
+        unsafe_pids.append(pid_dir)
+
+if not unsafe_pids:
+    print("SAFE_RUNNING")
+    sys.exit(0)
+
+queue_empty = False
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{{port}}/queue", timeout=5) as resp:
+        q = json.loads(resp.read().decode("utf-8"))
+        queue_empty = not q.get("queue_running") and not q.get("queue_pending")
+except Exception:
+    queue_empty = False
+
+if not queue_empty:
+    print("UNSAFE_BUSY")
+    sys.exit(0)
+
+print("NEEDS_RESTART")
+PY
+)"
+  if [ "${{takeover_state}}" = "SAFE_RUNNING" ]; then
+    need_start=false
+  elif [ "${{takeover_state}}" = "UNSAFE_BUSY" ]; then
+    echo "{CORS_HEADER_BUSY_SENTINEL}"
+    need_start=false
+  elif [ "${{takeover_state}}" = "NEEDS_RESTART" ]; then
+    need_start=true
+  fi
+fi
+
+if [ "${{need_start}}" = true ]; then
+  echo "=== [bootstrap] Installing Python dependencies ==="
+  if python3 -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1; then
+    grep -Evi '^(torch|torchvision|torchaudio)($|[=<>!~ ;[])' "${{COMFY_DIR}}/requirements.txt" > /tmp/comfy_reqs.txt || true
+  else
+    cp "${{COMFY_DIR}}/requirements.txt" /tmp/comfy_reqs.txt
+  fi
+  pip_install_req /tmp/comfy_reqs.txt
+  if [ -f "${{MANAGER_DIR}}/requirements.txt" ]; then
+    pip_install_req "${{MANAGER_DIR}}/requirements.txt"
+  fi
+
+  launch_new=true
+  if [ "${{takeover_state}}" = "NEEDS_RESTART" ] && curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
+    recheck_state="$(python3 - "${{COMFY_PORT}}" <<'PY'
 import glob, json, os, signal, sys, urllib.request
 
 port = int(sys.argv[1])
@@ -126,7 +213,7 @@ except Exception:
     queue_empty = False
 
 if not queue_empty:
-    print("UNSAFE_BUSY")
+    print("BECAME_BUSY")
     sys.exit(0)
 
 for pid in unsafe_pids:
@@ -134,56 +221,51 @@ for pid in unsafe_pids:
         os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
-print("RESTART_CLEAN")
+print("STOP_SENT")
 PY
 )"
-  if [ "${{takeover_state}}" = "SAFE_RUNNING" ]; then
-    need_start=false
-  elif [ "${{takeover_state}}" = "UNSAFE_BUSY" ]; then
-    echo "{CORS_HEADER_BUSY_SENTINEL}"
-    need_start=false
-  elif [ "${{takeover_state}}" = "RESTART_CLEAN" ]; then
-    echo "=== [bootstrap] Restarting ComfyUI without --enable-cors-header ==="
-    for _ in $(seq 1 20); do
-      if ! curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
+    if [ "${{recheck_state}}" = "SAFE_RUNNING" ]; then
+      launch_new=false
+    elif [ "${{recheck_state}}" = "BECAME_BUSY" ]; then
+      echo "{CORS_HEADER_BUSY_SENTINEL}"
+      launch_new=false
+    elif [ "${{recheck_state}}" = "STOP_SENT" ]; then
+      echo "=== [bootstrap] Restarting ComfyUI without --enable-cors-header ==="
+      stopped=false
+      for _ in $(seq 1 20); do
+        if ! curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
+          stopped=true
+          break
+        fi
+        sleep 1
+      done
+      if [ "${{stopped}}" != true ]; then
+        echo "[bootstrap] Error: existing ComfyUI with --enable-cors-header did not stop within 20s" >&2
+        exit 1
+      fi
+    fi
+  fi
+
+  if [ "${{launch_new}}" = true ]; then
+    echo "=== [bootstrap] Starting ComfyUI on 127.0.0.1:${{COMFY_PORT}} ==="
+    cd "${{COMFY_DIR}}"
+    nohup python3 main.py --listen 127.0.0.1 --port "${{COMFY_PORT}}" >/content/comfyui.log 2>&1 </dev/null &
+    disown || true
+
+    ready=false
+    for _ in $(seq 1 90); do
+      if curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
+        ready=true
         break
       fi
-      sleep 1
+      sleep 2
     done
-    need_start=true
-  fi
-fi
 
-if [ "${{need_start}}" = true ]; then
-  echo "=== [bootstrap] Installing Python dependencies ==="
-  if python3 -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1; then
-    grep -Evi '^(torch|torchvision|torchaudio)($|[=<>!~ ;[])' "${{COMFY_DIR}}/requirements.txt" > /tmp/comfy_reqs.txt || true
-  else
-    cp "${{COMFY_DIR}}/requirements.txt" /tmp/comfy_reqs.txt
-  fi
-  pip_install_req /tmp/comfy_reqs.txt
-  if [ -f "${{MANAGER_DIR}}/requirements.txt" ]; then
-    pip_install_req "${{MANAGER_DIR}}/requirements.txt"
-  fi
-
-  echo "=== [bootstrap] Starting ComfyUI on 127.0.0.1:${{COMFY_PORT}} ==="
-  cd "${{COMFY_DIR}}"
-  nohup python3 main.py --listen 127.0.0.1 --port "${{COMFY_PORT}}" >/content/comfyui.log 2>&1 </dev/null &
-  disown || true
-
-  ready=false
-  for _ in $(seq 1 90); do
-    if curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
-      ready=true
-      break
+    if [ "${{ready}}" != true ]; then
+      echo "[bootstrap] Error: ComfyUI failed to become ready within 180s. Last 60 log lines:" >&2
+      tail -n 60 /content/comfyui.log >&2 || true
+      exit 1
     fi
-    sleep 2
-  done
-
-  if [ "${{ready}}" != true ]; then
-    echo "[bootstrap] Error: ComfyUI failed to become ready within 180s. Last 60 log lines:" >&2
-    tail -n 60 /content/comfyui.log >&2 || true
-    exit 1
   fi
 fi
 
@@ -262,6 +344,27 @@ mod tests {
             pip_pos > start_if_pos,
             "pip_install_req must only run when starting ComfyUI"
         );
+    }
+
+    #[test]
+    fn bootstrap_script_installs_deps_before_terminating_unsafe_comfy() {
+        let script = build_remote_setup_script(8188);
+        let pip_comfy_pos = script.find("pip_install_req /tmp/comfy_reqs.txt").unwrap();
+        let pip_mgr_pos = script
+            .find("pip_install_req \"${MANAGER_DIR}/requirements.txt\"")
+            .unwrap();
+        let kill_pos = script.find("os.kill(pid, signal.SIGTERM)").unwrap();
+        assert!(
+            pip_comfy_pos < kill_pos && pip_mgr_pos < kill_pos,
+            "pip_install_req must complete before sending SIGTERM to existing ComfyUI"
+        );
+        assert_eq!(
+            script.matches("os.kill(pid, signal.SIGTERM)").count(),
+            1,
+            "SIGTERM should only appear in the post-install recheck block"
+        );
+        assert!(script.contains("NEEDS_RESTART"));
+        assert!(script.contains("BECAME_BUSY"));
     }
 
     #[test]
