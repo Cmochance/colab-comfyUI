@@ -67,34 +67,50 @@ pip_install_req() {{
   fi
 }}
 
-echo "=== [bootstrap] Installing Python dependencies ==="
-if python3 -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1; then
-  grep -Evi '^(torch|torchvision|torchaudio)($|[=<>!~ ;[])' "${{COMFY_DIR}}/requirements.txt" > /tmp/comfy_reqs.txt || true
-else
-  cp "${{COMFY_DIR}}/requirements.txt" /tmp/comfy_reqs.txt
-fi
-pip_install_req /tmp/comfy_reqs.txt
-if [ -f "${{MANAGER_DIR}}/requirements.txt" ]; then
-  pip_install_req "${{MANAGER_DIR}}/requirements.txt"
-fi
-
 need_start=true
 if curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
   echo "=== [bootstrap] Existing ComfyUI detected; auditing launch flags ==="
   takeover_state="$(python3 - "${{COMFY_PORT}}" <<'PY'
 import glob, json, os, signal, sys, urllib.request
 
-port = sys.argv[1]
-unsafe_pids = []
-for cmd_path in glob.glob("/proc/[0-9]*/cmdline"):
+port = int(sys.argv[1])
+port_hex = f":{{port:04X}}"
+listen_inodes = set()
+for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
     try:
-        with open(cmd_path, "rb") as f:
+        with open(proc_net, "r", encoding="utf-8", errors="replace") as f:
+            next(f, None)
+            for line in f:
+                cols = line.split()
+                if len(cols) >= 10 and cols[3] == "0A" and cols[1].upper().endswith(port_hex):
+                    listen_inodes.add(f"socket:[{{cols[9]}}]")
+    except OSError:
+        continue
+
+unsafe_pids = []
+for pid_dir in glob.glob("/proc/[0-9]*"):
+    try:
+        pid = int(os.path.basename(pid_dir))
+    except ValueError:
+        continue
+    if listen_inodes:
+        owns_port = False
+        for fd_path in glob.glob(f"{{pid_dir}}/fd/*"):
+            try:
+                if os.readlink(fd_path) in listen_inodes:
+                    owns_port = True
+                    break
+            except OSError:
+                continue
+        if not owns_port:
+            continue
+    try:
+        with open(f"{{pid_dir}}/cmdline", "rb") as f:
             raw = f.read().decode("utf-8", errors="replace")
     except OSError:
         continue
     args = [a for a in raw.split("\x00") if a]
     if any("main.py" in a for a in args) and "--enable-cors-header" in args:
-        pid = int(cmd_path.split("/")[2])
         unsafe_pids.append(pid)
 
 if not unsafe_pids:
@@ -139,6 +155,17 @@ PY
 fi
 
 if [ "${{need_start}}" = true ]; then
+  echo "=== [bootstrap] Installing Python dependencies ==="
+  if python3 -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1; then
+    grep -Evi '^(torch|torchvision|torchaudio)($|[=<>!~ ;[])' "${{COMFY_DIR}}/requirements.txt" > /tmp/comfy_reqs.txt || true
+  else
+    cp "${{COMFY_DIR}}/requirements.txt" /tmp/comfy_reqs.txt
+  fi
+  pip_install_req /tmp/comfy_reqs.txt
+  if [ -f "${{MANAGER_DIR}}/requirements.txt" ]; then
+    pip_install_req "${{MANAGER_DIR}}/requirements.txt"
+  fi
+
   echo "=== [bootstrap] Starting ComfyUI on 127.0.0.1:${{COMFY_PORT}} ==="
   cd "${{COMFY_DIR}}"
   nohup python3 main.py --listen 127.0.0.1 --port "${{COMFY_PORT}}" >/content/comfyui.log 2>&1 </dev/null &
@@ -224,8 +251,17 @@ mod tests {
             }
         }
         assert!(script.contains("--enable-cors-header"));
+        assert!(script.contains("/proc/net/tcp"));
         assert!(script.contains("/queue"));
         assert!(script.contains(COMFY_READY_SENTINEL));
+        let start_if_pos = script
+            .find("if [ \"${need_start}\" = true ]; then")
+            .unwrap();
+        let pip_pos = script.find("pip_install_req /tmp/comfy_reqs.txt").unwrap();
+        assert!(
+            pip_pos > start_if_pos,
+            "pip_install_req must only run when starting ComfyUI"
+        );
     }
 
     #[test]

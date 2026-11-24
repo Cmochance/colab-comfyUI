@@ -83,6 +83,8 @@ pub struct PendingSession {
     pub gpu: GpuTier,
     pub high_mem: bool,
     pub cancel_requested: bool,
+    #[serde(default)]
+    pub uncertain_orphan: bool,
     pub created_at_unix: u64,
 }
 

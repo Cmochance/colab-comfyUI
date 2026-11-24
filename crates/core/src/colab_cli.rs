@@ -48,8 +48,10 @@ pub enum SessionStatusLookup {
 pub struct StopReport {
     pub session_name: String,
     pub terminated_sentinel: bool,
+    pub already_gone: bool,
     pub endpoint_absent: bool,
     pub owner_verified: bool,
+    pub safe_to_clear_ledger: bool,
     pub usage: Option<UsageInfo>,
     pub billing_verified_stopped: bool,
     pub summary: String,
@@ -351,7 +353,13 @@ pub fn parse_new_output(gpu: GpuTier, out: &CommandOutput) -> Result<(), CoreErr
         || combined_raw.contains("too many active sessions")
         || combined_raw.contains("Response: 412 ")
         || combined_raw.contains(": Precondition Failed")
-        || combined_raw.contains("Response: 502 ")
+    {
+        return Err(CoreError::CapacityOrSessionLimit {
+            detail,
+            uncertain: false,
+        });
+    }
+    if combined_raw.contains("Response: 502 ")
         || combined_raw.contains(": Bad Gateway")
         || combined_raw.contains("Response: 503 ")
         || combined_raw.contains(": Service Unavailable")
@@ -362,7 +370,10 @@ pub fn parse_new_output(gpu: GpuTier, out: &CommandOutput) -> Result<(), CoreErr
         || combined_raw.contains("ConnectTimeout")
         || combined_raw.contains("Assignment request failed; retrying in")
     {
-        return Err(CoreError::CapacityOrSessionLimit { detail });
+        return Err(CoreError::CapacityOrSessionLimit {
+            detail,
+            uncertain: true,
+        });
     }
 
     Err(CoreError::CommandFailed {
@@ -595,7 +606,8 @@ pub async fn open_pay(
     Ok(())
 }
 
-/// Runs `colab stop -s <name>` and checks all 3 stop verification criteria plus `colab usage`.
+/// Runs pre-stop ownership & endpoint-fingerprint checks, executes `colab stop -s <name>`,
+/// and verifies absence + billing rate via `colab sessions` and `colab usage`.
 pub async fn stop_and_verify(
     runner: &dyn CommandRunner,
     colab_bin: &Path,
@@ -606,36 +618,7 @@ pub async fn stop_and_verify(
     on_line: Option<LineCallback>,
 ) -> Result<StopReport, CoreError> {
     validate_session_name(session_name)?;
-    let stop_out = runner
-        .run(
-            colab_spec(
-                colab_bin,
-                vec![
-                    "stop".to_string(),
-                    "-s".to_string(),
-                    session_name.to_string(),
-                ],
-                CLI_STOP_TIMEOUT,
-                COLAB_SHORT_REQ_TIMEOUT_SECS,
-                extra_envs,
-            ),
-            on_line.clone(),
-        )
-        .await?;
-    ensure_no_auth_error(&stop_out)?;
-
-    let terminated_sentinel = stop_out
-        .stdout_raw
-        .lines()
-        .any(|l| l.trim() == "[colab] Session terminated.");
-
     let mut warnings = Vec::new();
-    if !terminated_sentinel {
-        warnings.push(format!(
-            "colab stop 未返回 `[colab] Session terminated.`：{}",
-            stop_out.stdout.trim()
-        ));
-    }
 
     let owner_verified = match whoami(runner, colab_bin, extra_envs, on_line.clone()).await {
         Ok(actual) => {
@@ -643,57 +626,153 @@ pub async fn stop_and_verify(
                 true
             } else {
                 warnings.push(format!(
-                    "当前 colab 账号已切换为 {actual}（开机账号 {owner_email}），无法核对原账号状态。"
+                    "当前 colab 账号已切换为 {actual}（开机账号 {owner_email}），已跳过停机以免误操作。"
                 ));
                 false
             }
         }
+        Err(err @ CoreError::AuthRequired { .. }) => return Err(err),
         Err(err) => {
             warnings.push(format!("无法核对 colab whoami：{err}"));
             false
         }
     };
 
-    let endpoint_absent = if !owner_verified {
-        false
-    } else {
-        match sessions(runner, colab_bin, extra_envs, on_line.clone()).await {
-            Ok(list) => match expected_endpoint_sha256 {
-                Some(hash) => {
-                    let still_present = list.iter().any(|s| s.endpoint_sha256 == hash);
-                    if still_present {
-                        warnings.push("colab sessions 中仍检测到本会话对应实例，请立即前往 Colab 网页确认停机！".to_string());
-                    }
-                    !still_present
+    if !owner_verified {
+        return Ok(StopReport {
+            session_name: session_name.to_string(),
+            terminated_sentinel: false,
+            already_gone: false,
+            endpoint_absent: false,
+            owner_verified: false,
+            safe_to_clear_ledger: false,
+            usage: None,
+            billing_verified_stopped: false,
+            summary: "当前账号无法核验或已切换，未执行停机并已保留本地会话记录。".to_string(),
+            warnings,
+        });
+    }
+
+    let mut terminated_sentinel = false;
+    let mut already_gone = false;
+    let mut should_run_stop = true;
+
+    if let Some(expected_hash) = expected_endpoint_sha256 {
+        match status(runner, colab_bin, session_name, extra_envs, on_line.clone()).await {
+            Ok(SessionStatusLookup::Present(entry)) => {
+                if entry.endpoint_sha256 != expected_hash {
+                    should_run_stop = false;
+                    already_gone = true;
+                    warnings.push(format!(
+                        "会话名 '{session_name}' 当前指向另一个外部新建实例（端点指纹已变更），已跳过停机以免误杀外部实例。"
+                    ));
                 }
-                None => !list.iter().any(|s| s.name == session_name),
-            },
-            Err(err) => {
-                warnings.push(format!("无法核对 colab sessions：{err}"));
-                false
             }
+            Ok(SessionStatusLookup::Missing) => {
+                should_run_stop = false;
+                already_gone = true;
+            }
+            Err(_) => {}
+        }
+    }
+
+    if should_run_stop {
+        let stop_out = runner
+            .run(
+                colab_spec(
+                    colab_bin,
+                    vec![
+                        "stop".to_string(),
+                        "-s".to_string(),
+                        session_name.to_string(),
+                    ],
+                    CLI_STOP_TIMEOUT,
+                    COLAB_SHORT_REQ_TIMEOUT_SECS,
+                    extra_envs,
+                ),
+                on_line.clone(),
+            )
+            .await?;
+        ensure_no_auth_error(&stop_out)?;
+
+        terminated_sentinel = stop_out
+            .stdout_raw
+            .lines()
+            .any(|l| l.trim() == "[colab] Session terminated.");
+        let not_found_marker = format!("[colab] Session '{session_name}' not found.");
+        if stop_out.exit_code == Some(0)
+            && stop_out
+                .stdout_raw
+                .lines()
+                .any(|l| l.trim() == not_found_marker)
+        {
+            already_gone = true;
+        }
+        if !terminated_sentinel && !already_gone {
+            warnings.push(format!(
+                "colab stop 未返回预期终态：{}",
+                stop_out.stdout.trim()
+            ));
+        }
+    }
+
+    let endpoint_absent = match sessions(runner, colab_bin, extra_envs, on_line.clone()).await {
+        Ok(list) => match expected_endpoint_sha256 {
+            Some(hash) => {
+                let still_present = list.iter().any(|s| s.endpoint_sha256 == hash);
+                if still_present {
+                    warnings.push(
+                        "colab sessions 中仍检测到本会话对应实例，请立即前往 Colab 网页确认停机！"
+                            .to_string(),
+                    );
+                }
+                !still_present
+            }
+            None => {
+                let has_named = list.iter().any(|s| s.name == session_name);
+                let has_orphan = list.iter().any(|s| s.is_orphan);
+                if has_named {
+                    warnings.push(format!(
+                        "colab sessions 中仍检测到会话 '{session_name}'，请立即确认停机！"
+                    ));
+                }
+                if has_orphan {
+                    warnings.push(
+                        "colab sessions 中检测到未命名孤儿实例 [?]，可能是刚分配的实例，请前往 Colab 网页核对停机。"
+                            .to_string(),
+                    );
+                }
+                !has_named && !has_orphan
+            }
+        },
+        Err(err) => {
+            warnings.push(format!("无法核对 colab sessions：{err}"));
+            false
         }
     };
 
-    let usage_res = if owner_verified {
-        match usage(runner, colab_bin, extra_envs, on_line).await {
-            Ok(u) => Some(u),
-            Err(err) => {
-                warnings.push(format!("未能核对 colab usage 速率：{err}"));
-                None
-            }
+    let usage_res = match usage(runner, colab_bin, extra_envs, on_line).await {
+        Ok(u) => Some(u),
+        Err(err) => {
+            warnings.push(format!("未能核对 colab usage 速率：{err}"));
+            None
         }
-    } else {
-        None
     };
 
+    let safe_to_clear_ledger =
+        (terminated_sentinel || already_gone) && endpoint_absent && owner_verified;
     let billing_verified_stopped;
-    let summary = if terminated_sentinel && endpoint_absent && owner_verified {
+    let summary = if safe_to_clear_ledger {
+        let prefix = if terminated_sentinel {
+            "本会话已终止"
+        } else {
+            "云端会话此前已不存在（可能已被 Colab 回收），已清理本地记录"
+        };
         match &usage_res {
             Some(u) if u.active_assignments == 0 && u.usage_rate_hourly == 0.0 => {
                 billing_verified_stopped = true;
                 format!(
-                    "已停机并核验停止计费（Active assignments: 0，Usage rate: {:.2}/hr）。",
+                    "{prefix}并核验停止计费（Active assignments: 0，Usage rate: {:.2}/hr）。",
                     u.usage_rate_hourly
                 )
             }
@@ -704,14 +783,14 @@ pub async fn stop_and_verify(
                     u.usage_rate_hourly
                 ));
                 format!(
-                    "本会话已终止，但计算速率尚未归零（{:.2}/hr）。",
+                    "{prefix}，但计算速率尚未归零（{:.2}/hr）。",
                     u.usage_rate_hourly
                 )
             }
             Some(u) => {
                 billing_verified_stopped = false;
                 let msg = format!(
-                    "本会话已停，账号下仍有 {} 个其他实例在计费（当前速率 {:.2}/hr）。",
+                    "{prefix}，账号下仍有 {} 个其他实例在计费（当前速率 {:.2}/hr）。",
                     u.active_assignments, u.usage_rate_hourly
                 );
                 warnings.push(msg.clone());
@@ -719,19 +798,22 @@ pub async fn stop_and_verify(
             }
             None => {
                 billing_verified_stopped = false;
-                "本会话已终止且实例列表已消失，但未能核对到 colab usage 速率。".to_string()
+                format!("{prefix}且实例列表已确认消失，但未能核对到 colab usage 速率。")
             }
         }
     } else {
         billing_verified_stopped = false;
-        "未能完成全部停机核验，请勿假设已停止计费，建议立即打开 Colab 网页确认。".to_string()
+        "未能完成全部停机核验，已保留本地会话记录；请勿假设已停止计费，建议立即打开 Colab 网页确认。"
+            .to_string()
     };
 
     Ok(StopReport {
         session_name: session_name.to_string(),
         terminated_sentinel,
+        already_gone,
         endpoint_absent,
         owner_verified,
+        safe_to_clear_ledger,
         usage: usage_res,
         billing_verified_stopped,
         summary,
@@ -909,10 +991,13 @@ mod tests {
         ] {
             let out = CommandOutput::from_raw(Some(1), String::new(), raw_err.to_string());
             match parse_new_output(GpuTier::L4, &out) {
-                Err(CoreError::CapacityOrSessionLimit { detail }) => {
+                Err(CoreError::CapacityOrSessionLimit {
+                    detail,
+                    uncertain: true,
+                }) => {
                     assert!(!detail.contains(" - DEBUG - "));
                 }
-                other => panic!("expected CapacityOrSessionLimit, got {other:?}"),
+                other => panic!("expected uncertain CapacityOrSessionLimit, got {other:?}"),
             }
         }
     }
@@ -951,22 +1036,30 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_verify_handles_clean_stop_and_other_active_assignments() {
+    fn stop_and_verify_handles_clean_stop_reclaimed_session_and_fingerprint_mismatch() {
         let endpoint_hash = sha256_hex(b"m-s-mine");
         let runner_clean = FakeRunner::new(vec![
-            FakeCall {
-                expected_subcmd: "stop".to_string(),
-                output: Ok(CommandOutput::from_raw(
-                    Some(0),
-                    "[colab] Stopping session 'comfy-1234abcd'...\n[colab] Session terminated.".to_string(),
-                    String::new(),
-                )),
-            },
             FakeCall {
                 expected_subcmd: "whoami".to_string(),
                 output: Ok(CommandOutput::from_raw(
                     Some(0),
                     "Auth provider: oauth2\nEmail:         alice@example.com\n".to_string(),
+                    String::new(),
+                )),
+            },
+            FakeCall {
+                expected_subcmd: "status".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "[comfy-1234abcd] m-s-mine | Hardware: NVIDIA L4 | Shape: Standard | Variant: GPU".to_string(),
+                    String::new(),
+                )),
+            },
+            FakeCall {
+                expected_subcmd: "stop".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "[colab] Stopping session 'comfy-1234abcd'...\n[colab] Session terminated.".to_string(),
                     String::new(),
                 )),
             },
@@ -999,12 +1092,21 @@ mod tests {
         ))
         .unwrap();
         assert!(report_clean.billing_verified_stopped);
+        assert!(report_clean.safe_to_clear_ledger);
         assert!(report_clean.warnings.is_empty());
 
-        // Case 2: stop prints `not found` with exit code 0!
-        let runner_missing_stop = FakeRunner::new(vec![
+        // Case 2 (H1): session reclaimed on server -> `not found.` + sessions empty clears ledger!
+        let runner_reclaimed = FakeRunner::new(vec![
             FakeCall {
-                expected_subcmd: "stop".to_string(),
+                expected_subcmd: "whoami".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "Email: alice@example.com\n".to_string(),
+                    String::new(),
+                )),
+            },
+            FakeCall {
+                expected_subcmd: "status".to_string(),
                 output: Ok(CommandOutput::from_raw(
                     Some(0),
                     "[colab] Session 'comfy-1234abcd' not found.".to_string(),
@@ -1012,10 +1114,100 @@ mod tests {
                 )),
             },
             FakeCall {
+                expected_subcmd: "sessions".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "[colab] No active sessions found on server.".to_string(),
+                    String::new(),
+                )),
+            },
+            FakeCall {
+                expected_subcmd: "usage".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "Current balance: 99.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0".to_string(),
+                    String::new(),
+                )),
+            },
+        ]);
+        let report_reclaimed = block_on(stop_and_verify(
+            &runner_reclaimed,
+            Path::new("/usr/local/bin/colab"),
+            "comfy-1234abcd",
+            "alice@example.com",
+            Some(&endpoint_hash),
+            &[],
+            None,
+        ))
+        .unwrap();
+        assert!(report_reclaimed.already_gone);
+        assert!(report_reclaimed.endpoint_absent);
+        assert!(report_reclaimed.safe_to_clear_ledger);
+        assert!(report_reclaimed.billing_verified_stopped);
+
+        // Case 3 (L1): external instance reused session name -> do NOT invoke `colab stop`!
+        let runner_external_new = FakeRunner::new(vec![
+            FakeCall {
                 expected_subcmd: "whoami".to_string(),
                 output: Ok(CommandOutput::from_raw(
                     Some(0),
                     "Email: alice@example.com\n".to_string(),
+                    String::new(),
+                )),
+            },
+            FakeCall {
+                expected_subcmd: "status".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "[comfy-1234abcd] m-s-other-instance | Hardware: NVIDIA L4 | Shape: Standard | Variant: GPU".to_string(),
+                    String::new(),
+                )),
+            },
+            FakeCall {
+                expected_subcmd: "sessions".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "[comfy-1234abcd] m-s-other-instance | Hardware: NVIDIA L4 | Shape: Standard | Variant: GPU".to_string(),
+                    String::new(),
+                )),
+            },
+            FakeCall {
+                expected_subcmd: "usage".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "Current balance: 99.00 compute units\nUsage rate: 1.97/hr\nActive assignments: 1".to_string(),
+                    String::new(),
+                )),
+            },
+        ]);
+        let report_ext = block_on(stop_and_verify(
+            &runner_external_new,
+            Path::new("/usr/local/bin/colab"),
+            "comfy-1234abcd",
+            "alice@example.com",
+            Some(&endpoint_hash),
+            &[],
+            None,
+        ))
+        .unwrap();
+        assert!(report_ext.safe_to_clear_ledger);
+        assert!(!report_ext.warnings.is_empty());
+
+        // Case 4: CLI lost local name -> `not found.` on stop, but `[?] m-s-mine` still billing!
+        let runner_orphan_still_alive = FakeRunner::new(vec![
+            FakeCall {
+                expected_subcmd: "whoami".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "Email: alice@example.com\n".to_string(),
+                    String::new(),
+                )),
+            },
+            FakeCall {
+                expected_subcmd: "status".to_string(),
+                output: Ok(CommandOutput::from_raw(
+                    Some(0),
+                    "[colab] Session 'comfy-1234abcd' not found.".to_string(),
                     String::new(),
                 )),
             },
@@ -1037,7 +1229,7 @@ mod tests {
             },
         ]);
         let report_fail = block_on(stop_and_verify(
-            &runner_missing_stop,
+            &runner_orphan_still_alive,
             Path::new("/usr/local/bin/colab"),
             "comfy-1234abcd",
             "alice@example.com",
@@ -1048,6 +1240,7 @@ mod tests {
         .unwrap();
         assert!(!report_fail.terminated_sentinel);
         assert!(!report_fail.endpoint_absent);
+        assert!(!report_fail.safe_to_clear_ledger);
         assert!(!report_fail.billing_verified_stopped);
     }
 

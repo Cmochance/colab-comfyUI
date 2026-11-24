@@ -2,8 +2,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::colab_cli::{self, SessionStatusLookup};
@@ -12,7 +14,9 @@ use crate::config::{
     ssh_key_path, ssh_pub_key_path, validate_session_name, ActiveSession, StateLock,
 };
 use crate::locate::{SSH_BIN, SSH_KEYGEN_BIN};
-use crate::runner::{BoxFuture, CommandRunner, CommandSpec, LineCallback, StdinPolicy};
+use crate::runner::{
+    redact_sensitive_text, BoxFuture, CommandRunner, CommandSpec, LineCallback, StdinPolicy,
+};
 use crate::CoreError;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -20,14 +24,20 @@ const KEYGEN_TIMEOUT: Duration = Duration::from_secs(15);
 const MASTER_READY_TIMEOUT: Duration = Duration::from_secs(45);
 const MUX_CTL_TIMEOUT: Duration = Duration::from_secs(5);
 
+const MAX_SSH_STDERR_LINES: usize = 20;
+
 /// Handle for a running `ssh -M -S ...` ControlMaster process (real or mocked).
 pub trait TunnelProcess: Send {
     fn try_wait(&mut self) -> Result<Option<i32>, CoreError>;
     fn kill<'a>(&'a mut self) -> BoxFuture<'a, Result<(), CoreError>>;
+    fn recent_stderr(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct TokioTunnelProcess {
     child: Child,
+    stderr_lines: Arc<StdMutex<Vec<String>>>,
 }
 
 impl TunnelProcess for TokioTunnelProcess {
@@ -47,6 +57,15 @@ impl TunnelProcess for TokioTunnelProcess {
             let _ = self.child.wait().await;
             Ok(())
         })
+    }
+
+    fn recent_stderr(&self) -> Option<String> {
+        let lines = self.stderr_lines.lock().unwrap();
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join(" | "))
+        }
     }
 }
 
@@ -71,22 +90,53 @@ impl TunnelSpawner for TokioTunnelSpawner {
         envs: &[(String, String)],
     ) -> Result<Box<dyn TunnelProcess>, CoreError> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
+        cmd.kill_on_drop(true)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        let child = cmd.spawn().map_err(|source| CoreError::Io {
+        let mut child = cmd.spawn().map_err(|source| CoreError::Io {
             context: format!("spawn {}", program.display()),
             source,
         })?;
-        Ok(Box::new(TokioTunnelProcess { child }))
+        let stderr_lines = Arc::new(StdMutex::new(Vec::new()));
+        if let Some(stderr) = child.stderr.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let buf = stderr_lines.clone();
+                handle.spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let redacted = redact_sensitive_text(line.trim());
+                        if redacted.is_empty() {
+                            continue;
+                        }
+                        let mut guard = buf.lock().unwrap();
+                        if guard.len() >= MAX_SSH_STDERR_LINES {
+                            guard.remove(0);
+                        }
+                        guard.push(redacted);
+                    }
+                });
+            }
+        }
+        Ok(Box::new(TokioTunnelProcess {
+            child,
+            stderr_lines,
+        }))
     }
 }
 
-/// Ensures `~/.colab-comfyui/ssh/id_ed25519` (+ `.pub`) exists with `0600` permissions.
+fn set_ssh_file_0600(path: &Path) -> Result<(), CoreError> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| CoreError::Io {
+        context: format!("chmod 0600 {}", path.display()),
+        source,
+    })
+}
+
+/// Ensures `~/.colab-comfyui/ssh/id_ed25519` and `.pub` exist with `0600` permissions.
 pub async fn ensure_ed25519_key(
     data_dir: &Path,
     runner: &dyn CommandRunner,
@@ -95,12 +145,8 @@ pub async fn ensure_ed25519_key(
     let pub_path = ssh_pub_key_path(data_dir);
 
     if key_path.exists() && pub_path.exists() {
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            CoreError::Io {
-                context: format!("chmod 0600 {}", key_path.display()),
-                source,
-            }
-        })?;
+        set_ssh_file_0600(&key_path)?;
+        set_ssh_file_0600(&pub_path)?;
         return Ok(());
     }
 
@@ -126,19 +172,15 @@ pub async fn ensure_ed25519_key(
         KEYGEN_TIMEOUT,
     );
     let out = runner.run(spec, None).await?;
-    if out.exit_code != Some(0) || !key_path.exists() {
+    if out.exit_code != Some(0) || !key_path.exists() || !pub_path.exists() {
         return Err(CoreError::CommandFailed {
             command: SSH_KEYGEN_BIN.to_string(),
             exit_code: out.exit_code,
             stderr: out.stderr,
         });
     }
-    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-        CoreError::Io {
-            context: format!("chmod 0600 {}", key_path.display()),
-            source,
-        }
-    })?;
+    set_ssh_file_0600(&key_path)?;
+    set_ssh_file_0600(&pub_path)?;
     Ok(())
 }
 
@@ -373,9 +415,16 @@ pub async fn start_master_and_verify(
     let deadline = tokio::time::Instant::now() + MASTER_READY_TIMEOUT;
     loop {
         if let Some(code) = process.try_wait()? {
-            return Err(CoreError::TunnelFailed {
-                detail: format!("ssh ControlMaster exited early with code {code}"),
-            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let stderr_note = process.recent_stderr();
+            if let (Some(cb), Some(ref msg)) = (&on_line, &stderr_note) {
+                cb(format!("ssh stderr: {msg}"));
+            }
+            let detail = match stderr_note {
+                Some(msg) => format!("ssh ControlMaster exited early with code {code}: {msg}"),
+                None => format!("ssh ControlMaster exited early with code {code}"),
+            };
+            return Err(CoreError::TunnelFailed { detail });
         }
         let check = runner.run(build_mux_check_spec(&ctl_sock), None).await;
         if let Ok(out) = check {
@@ -690,5 +739,29 @@ mod tests {
         .unwrap();
         assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 1);
         assert!(started.session_count_warning.is_some());
+    }
+
+    #[test]
+    fn ensure_ed25519_key_enforces_0600_on_private_and_public_keys() {
+        let tmp = ShortTempDir::new();
+        ensure_data_dirs(&tmp.0).unwrap();
+        let priv_path = ssh_key_path(&tmp.0);
+        let pub_path = ssh_pub_key_path(&tmp.0);
+        fs::write(&priv_path, "priv").unwrap();
+        fs::write(&pub_path, "pub").unwrap();
+        fs::set_permissions(&priv_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&pub_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let runner = ScriptedRunner::new(vec![]);
+        block_on(ensure_ed25519_key(&tmp.0, &runner)).unwrap();
+
+        assert_eq!(
+            fs::metadata(&priv_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&pub_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

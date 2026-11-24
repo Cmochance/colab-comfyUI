@@ -95,6 +95,7 @@ impl CommandRunner for TokioCommandRunner {
         Box::pin(async move {
             let cmd_label = spec.program.display().to_string();
             let mut cmd = Command::new(&spec.program);
+            cmd.kill_on_drop(true);
             cmd.args(&spec.args);
             for (k, v) in &spec.envs {
                 cmd.env(k, v);

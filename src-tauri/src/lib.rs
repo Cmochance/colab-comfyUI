@@ -135,12 +135,21 @@ async fn reconnect_tunnel(state: tauri::State<'_, AppState>) -> Result<AppSnapsh
 }
 
 #[tauri::command]
-async fn stop_session(state: tauri::State<'_, AppState>) -> Result<StopReport, UiError> {
-    state
+async fn stop_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<StopReport, UiError> {
+    let report = state
         .manager
         .stop_session()
         .await
-        .map_err(|e| UiError::from(&e))
+        .map_err(|e| UiError::from(&e))?;
+    if report.safe_to_clear_ledger {
+        if let Some(canvas) = app.get_webview_window("canvas") {
+            let _ = canvas.close();
+        }
+    }
+    Ok(report)
 }
 
 fn build_canvas_window(
@@ -254,12 +263,15 @@ async fn stop_and_exit(
             .stop_session()
             .await
             .map_err(|e| UiError::from(&e))?;
-        if !(report.terminated_sentinel && report.endpoint_absent && report.owner_verified) {
+        if !report.safe_to_clear_ledger {
             return Err(UiError {
                 code: "STOP_UNVERIFIED".to_string(),
                 message: report.summary,
             });
         }
+    }
+    if let Some(canvas) = app.get_webview_window("canvas") {
+        let _ = canvas.close();
     }
     state.allow_immediate_exit.store(true, Ordering::SeqCst);
     app_nap::set_active(&app, false);
@@ -365,6 +377,8 @@ pub fn run() {
             {
                 api.prevent_close();
                 show_main_for_exit_confirm(app_handle);
+            } else if let Some(canvas) = app_handle.get_webview_window("canvas") {
+                let _ = canvas.close();
             }
         }
         RunEvent::ExitRequested { api, .. } => {
@@ -377,10 +391,7 @@ pub fn run() {
             }
         }
         #[cfg(target_os = "macos")]
-        RunEvent::Reopen {
-            has_visible_windows: false,
-            ..
-        } => {
+        RunEvent::Reopen { .. } => {
             if let Some(window) = app_handle.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.unminimize();

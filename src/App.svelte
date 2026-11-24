@@ -43,6 +43,7 @@
     gpu: GpuTier;
     high_mem: boolean;
     cancel_requested: boolean;
+    uncertain_orphan: boolean;
     created_at_unix: number;
   }
 
@@ -60,8 +61,10 @@
   interface StopReport {
     session_name: string;
     terminated_sentinel: boolean;
+    already_gone: boolean;
     endpoint_absent: boolean;
     owner_verified: boolean;
+    safe_to_clear_ledger: boolean;
     usage: UsageInfo | null;
     billing_verified_stopped: boolean;
     summary: string;
@@ -82,6 +85,7 @@
     usage: UsageInfo | null;
     active_session: ActiveSession | null;
     pending_session: PendingSession | null;
+    ledger_corrupted: boolean;
     orphan_count: number;
     startup_notice: StartupNotice | null;
     warning_banner: string | null;
@@ -114,13 +118,18 @@
   let selectedGpu = $state<GpuTier>('L4');
   let highMem = $state(false);
   let configSynced = $state(false);
-  let busy = $state(false);
+  let starting = $state(false);
+  let stopping = $state(false);
+  let reconnecting = $state(false);
+  let refreshing = $state(false);
+  let exitBusy = $state(false);
   let logsExpanded = $state(false);
   let showZeroCuModal = $state(false);
   let showExitModal = $state(false);
   let actionError = $state<UiError | null>(null);
   let elapsedSecs = $state(0);
 
+  const busy = $derived(starting || stopping || reconnecting || refreshing || exitBusy);
   const t = (key: string, fallback: string) => snap?.i18n?.[key] ?? fallback;
 
   const highMemSupported = $derived(selectedGpu !== 'L4');
@@ -178,19 +187,31 @@
   });
 
   async function runRefresh() {
-    busy = true;
+    refreshing = true;
     actionError = null;
     try {
       snap = await invoke<AppSnapshot>('refresh_status');
     } catch (err) {
       actionError = err as UiError;
     } finally {
-      busy = false;
+      refreshing = false;
+    }
+  }
+
+  async function runReconcile() {
+    refreshing = true;
+    actionError = null;
+    try {
+      snap = await invoke<AppSnapshot>('reconcile_startup');
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      refreshing = false;
     }
   }
 
   async function runStart(allowZeroBalance: boolean) {
-    busy = true;
+    starting = true;
     actionError = null;
     showZeroCuModal = false;
     logsExpanded = true;
@@ -209,7 +230,7 @@
         logsExpanded = true;
       }
     } finally {
-      busy = false;
+      starting = false;
     }
   }
 
@@ -219,7 +240,7 @@
   }
 
   async function runReconnect() {
-    busy = true;
+    reconnecting = true;
     actionError = null;
     try {
       snap = await invoke<AppSnapshot>('reconnect_tunnel');
@@ -227,7 +248,7 @@
       actionError = err as UiError;
       logsExpanded = true;
     } finally {
-      busy = false;
+      reconnecting = false;
     }
   }
 
@@ -250,7 +271,7 @@
   }
 
   async function runStop() {
-    busy = true;
+    stopping = true;
     actionError = null;
     try {
       await invoke<StopReport>('stop_session');
@@ -258,7 +279,7 @@
     } catch (err) {
       actionError = err as UiError;
     } finally {
-      busy = false;
+      stopping = false;
     }
   }
 
@@ -281,14 +302,14 @@
   }
 
   async function runStopAndExit() {
-    busy = true;
+    exitBusy = true;
     actionError = null;
     try {
       await invoke('stop_and_exit');
     } catch (err) {
       showExitModal = false;
       actionError = err as UiError;
-      busy = false;
+      exitBusy = false;
     }
   }
 
@@ -383,7 +404,7 @@
         <select
           id="gpu-select"
           bind:value={selectedGpu}
-          disabled={busy || Boolean(snap?.active_session) || Boolean(snap?.pending_session)}
+          disabled={busy || Boolean(snap?.active_session) || Boolean(snap?.pending_session) || Boolean(snap?.ledger_corrupted)}
         >
           {#each GPU_OPTIONS as opt}
             <option value={opt.value}>{opt.label} — {opt.note}</option>
@@ -395,7 +416,7 @@
           <input
             type="checkbox"
             bind:checked={highMem}
-            disabled={!highMemSupported || busy || Boolean(snap?.active_session) || Boolean(snap?.pending_session)}
+            disabled={!highMemSupported || busy || Boolean(snap?.active_session) || Boolean(snap?.pending_session) || Boolean(snap?.ledger_corrupted)}
           />
           {t('high_ram_label', 'High-RAM 高内存')}
         </label>
@@ -409,13 +430,18 @@
           <span>硬件: {snap.active_session.hardware_summary}</span>
           <span>本地代理: <code>127.0.0.1:{snap.active_session.local_port}</code></span>
         </div>
+      {:else if snap?.pending_session}
+        <div class="session-meta">
+          <span>待核对会话: <code>{snap.pending_session.session_name}</code></span>
+          <span>GPU: {snap.pending_session.gpu}</span>
+        </div>
       {/if}
     </div>
   </section>
 
   <section class="card">
     <div class="controls">
-      {#if !snap?.active_session && !snap?.pending_session}
+      {#if !snap?.active_session && !snap?.pending_session && !snap?.ledger_corrupted}
         <button
           class="primary"
           onclick={() => runStart(false)}
@@ -426,8 +452,10 @@
       {/if}
 
       {#if snap?.phase === 'Starting'}
-        <button class="danger" onclick={runCancelStart}>
-          {t('btn_cancel_start', '取消开机（等待分配后停机）')}
+        <button class="danger" onclick={runCancelStart} disabled={stopping}>
+          {snap?.active_session
+            ? '取消开机并立即停机'
+            : t('btn_cancel_start', '取消开机（等待分配后停机）')}
         </button>
       {/if}
 
@@ -435,14 +463,28 @@
         <button class="primary" onclick={runOpenCanvas} disabled={!snap.tunnel_connected}>
           {t('btn_open_canvas', '打开 ComfyUI 画布')}
         </button>
-        <button class="secondary" onclick={runReconnect} disabled={busy}>
+        <button class="secondary" onclick={runReconnect} disabled={starting || reconnecting || stopping || refreshing}>
           {t('btn_reconnect', '重连本地隧道')}
         </button>
-        <button class="secondary" onclick={runOpenColabUrl} disabled={busy}>
+        <button class="secondary" onclick={runOpenColabUrl} disabled={stopping}>
           {t('btn_open_colab_url', '在浏览器打开 Colab 页')}
         </button>
-        <button class="danger" onclick={runStop} disabled={busy}>
+        <button class="danger" onclick={runStop} disabled={stopping}>
           {t('btn_stop', '停机并核验停止计费')}
+        </button>
+      {/if}
+
+      {#if (snap?.pending_session || snap?.ledger_corrupted) && !snap?.active_session && snap?.phase !== 'Starting'}
+        <button class="secondary" onclick={runReconcile} disabled={refreshing || stopping}>
+          重新对账云端状态
+        </button>
+        {#if snap?.pending_session}
+          <button class="danger" onclick={runStop} disabled={stopping}>
+            {t('btn_stop', '停机并核验停止计费')}
+          </button>
+        {/if}
+        <button class="secondary" onclick={runOpenManageSessions}>
+          {t('btn_open_manage_sessions', '打开 Colab 管理会话')}
         </button>
       {/if}
     </div>
@@ -519,13 +561,13 @@
       <h3>{t('exit_title', '云端 Colab 会话仍在计费')}</h3>
       <p>{t('exit_body', '退出 App 不会停止 Colab 会话，计算单元会继续扣费。请选择：')}</p>
       <div class="modal-actions">
-        <button class="danger" onclick={runStopAndExit} disabled={busy}>
+        <button class="danger" onclick={runStopAndExit} disabled={exitBusy}>
           {t('exit_stop_and_quit', '立即停机并退出')}
         </button>
-        <button class="secondary" onclick={runLeaveRunningAndExit} disabled={busy}>
+        <button class="secondary" onclick={runLeaveRunningAndExit} disabled={exitBusy}>
           {t('exit_leave_running', '保留云端运行仅退出（继续计费）')}
         </button>
-        <button class="secondary" onclick={() => (showExitModal = false)} disabled={busy}>
+        <button class="secondary" onclick={() => (showExitModal = false)} disabled={exitBusy}>
           {t('exit_cancel', '取消')}
         </button>
       </div>
