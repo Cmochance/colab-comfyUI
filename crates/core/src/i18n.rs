@@ -61,6 +61,8 @@ pub enum MsgKey {
     LogsEmpty,
     StopVerifiedOk,
     StopWarningPrefix,
+    StartingElapsedHint,
+    ReconnectingElapsedHint,
 }
 
 impl MsgKey {
@@ -114,6 +116,8 @@ impl MsgKey {
             Self::LogsEmpty => "logs_empty",
             Self::StopVerifiedOk => "stop_verified_ok",
             Self::StopWarningPrefix => "stop_warning_prefix",
+            Self::StartingElapsedHint => "starting_elapsed_hint",
+            Self::ReconnectingElapsedHint => "reconnecting_elapsed_hint",
         }
     }
 
@@ -167,6 +171,8 @@ impl MsgKey {
             Self::LogsEmpty,
             Self::StopVerifiedOk,
             Self::StopWarningPrefix,
+            Self::StartingElapsedHint,
+            Self::ReconnectingElapsedHint,
         ]
     }
 }
@@ -223,6 +229,8 @@ pub fn t(locale: Locale, key: MsgKey) -> &'static str {
             MsgKey::LogsEmpty => "暂无日志",
             MsgKey::StopVerifiedOk => "会话已停机并核验停止计费。",
             MsgKey::StopWarningPrefix => "停机核验告警：",
+            MsgKey::StartingElapsedHint => "正在等待云端响应，已耗时 {secs}s（Colab 容量紧张时会自动退避重试，可点取消安全停机）",
+            MsgKey::ReconnectingElapsedHint => "正在重连本地 SSH 隧道，已耗时 {secs}s…",
         },
     }
 }

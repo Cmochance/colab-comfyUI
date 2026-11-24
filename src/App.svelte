@@ -119,10 +119,12 @@
   let showZeroCuModal = $state(false);
   let showExitModal = $state(false);
   let actionError = $state<UiError | null>(null);
+  let elapsedSecs = $state(0);
 
   const t = (key: string, fallback: string) => snap?.i18n?.[key] ?? fallback;
 
   const highMemSupported = $derived(selectedGpu !== 'L4');
+  const isTimedPhase = $derived(snap?.phase === 'Starting' || snap?.phase === 'Reconnecting');
   const activeStepIndex = $derived.by(() => {
     if (!snap?.step) return -1;
     return STEPS.findIndex((s) => s.key === snap?.step);
@@ -132,6 +134,19 @@
     if (!highMemSupported && highMem) {
       highMem = false;
     }
+  });
+
+  $effect(() => {
+    if (!isTimedPhase) {
+      elapsedSecs = 0;
+      return;
+    }
+    elapsedSecs = 0;
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      elapsedSecs = Math.floor((Date.now() - startedAt) / 1000);
+    }, 1000);
+    return () => clearInterval(timer);
   });
 
   $effect(() => {
@@ -178,6 +193,7 @@
     busy = true;
     actionError = null;
     showZeroCuModal = false;
+    logsExpanded = true;
     try {
       snap = await invoke<AppSnapshot>('start_session', {
         gpu: selectedGpu,
@@ -442,6 +458,17 @@
         </li>
       {/each}
     </ol>
+    {#if isTimedPhase}
+      <p class="elapsed-hint">
+        {(snap?.phase === 'Reconnecting'
+          ? t('reconnecting_elapsed_hint', '正在重连本地 SSH 隧道，已耗时 {secs}s…')
+          : t(
+              'starting_elapsed_hint',
+              '正在等待云端响应，已耗时 {secs}s（Colab 容量紧张时会自动退避重试，可点取消安全停机）'
+            )
+        ).replace('{secs}', String(elapsedSecs))}
+      </p>
+    {/if}
   </section>
 
   {#if snap?.last_stop_report}
@@ -754,6 +781,12 @@
   .steps li.done {
     opacity: 1;
     background: light-dark(#e8f7ee, #173626);
+  }
+
+  .elapsed-hint {
+    margin: 10px 0 0;
+    font-size: 12px;
+    opacity: 0.8;
   }
 
   .log-box {

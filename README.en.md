@@ -21,7 +21,7 @@ Usable (**v0.2.0 Phase 1 MVP**):
 
 - One-click launch: supports `L4` (`High-RAM` disabled), `T4`, `G4`, `A100`, and `H100`, with preflight `colab` auth and compute-unit balance checks (confirm prompt on 0 CU)
 - Zero-exposure local tunnel: single-slot SSH `ControlMaster` forwarding to a local Unix socket behind a `127.0.0.1:18188` `Host`/`Origin`-validated reverse proxy (no public tunnels, no `--enable-cors-header`)
-- Isolated dual windows: the `main` shell manages session lifecycle and redacted logs, while the `canvas` window displays ComfyUI with zero Tauri IPC permissions
+- Isolated dual windows: the `main` shell manages session lifecycle, live launch progress, and redacted logs (also persisted to `0600` `~/.colab-comfyui/app.log`), while the `canvas` window displays ComfyUI with zero Tauri IPC permissions
 - Billing safeguards: two-phase local session ledger (`~/.colab-comfyui/`), startup reconciliation, three-way exit confirmation, triple-verified stop reports, and a link to manage `[?]` orphan sessions
 
 Planned next:

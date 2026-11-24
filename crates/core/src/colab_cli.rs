@@ -12,6 +12,8 @@ const CLI_NEW_TIMEOUT: Duration = Duration::from_secs(600);
 const CLI_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 const COLAB_SHORT_REQ_TIMEOUT_SECS: &str = "30";
 const COLAB_NEW_REQ_TIMEOUT_SECS: &str = "120";
+const COLAB_NEW_ASSIGN_RETRIES: &str = "1";
+const COLAB_NEW_RETRY_BACKOFF_SECS: &str = "5";
 
 /// Parsed output of `colab usage`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -281,6 +283,47 @@ pub fn parse_sessions_output(out: &CommandOutput) -> Result<Vec<SessionEntry>, C
     }
 }
 
+/// Filters noisy `DEBUG`/`INFO` & response-body lines emitted when `colab --logtostderr new` runs.
+pub fn should_forward_new_session_log_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || is_update_banner_line(trimmed) {
+        return false;
+    }
+    trimmed.starts_with("[colab]")
+        || trimmed.contains(" - WARNING - ")
+        || trimmed.contains(" - ERROR - ")
+        || trimmed.contains(" - CRITICAL - ")
+        || trimmed.starts_with("ColabRequestError:")
+        || trimmed.contains("ReadTimeout")
+        || trimmed.contains("ConnectTimeout")
+        || trimmed.contains("ProxyError")
+        || trimmed.starts_with("TimeoutError:")
+        || trimmed.starts_with("To authorize colab-cli")
+}
+
+fn summarize_new_failure_detail(out: &CommandOutput) -> String {
+    let important: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter(|line| should_forward_new_session_log_line(line))
+        .collect();
+    if !important.is_empty() {
+        return important.join("\n");
+    }
+
+    let non_debug: Vec<&str> = out
+        .stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.contains(" - DEBUG - "))
+        .collect();
+    if !non_debug.is_empty() {
+        return non_debug.join("\n");
+    }
+
+    out.stdout.trim().to_string()
+}
+
 pub fn parse_new_output(gpu: GpuTier, out: &CommandOutput) -> Result<(), CoreError> {
     ensure_no_auth_error(out)?;
     if out
@@ -292,32 +335,40 @@ pub fn parse_new_output(gpu: GpuTier, out: &CommandOutput) -> Result<(), CoreErr
     }
 
     let combined_raw = format!("{}\n{}", out.stdout_raw, out.stderr_raw);
+    let detail = summarize_new_failure_detail(out);
     if combined_raw.contains("Backend rejected accelerator")
         || combined_raw.contains("not entitled")
         || combined_raw.contains("HTTP 400")
+        || combined_raw.contains("Response: 400 ")
+        || combined_raw.contains(": Bad Request")
     {
         return Err(CoreError::NoAcceleratorQuota {
             gpu: gpu.as_cli_arg().to_string(),
-            detail: out.stderr.clone(),
+            detail,
         });
     }
     if combined_raw.contains("Allocation refused (precondition failed)")
-        || combined_raw.contains("412")
         || combined_raw.contains("too many active sessions")
+        || combined_raw.contains("Response: 412 ")
+        || combined_raw.contains(": Precondition Failed")
+        || combined_raw.contains("Response: 502 ")
+        || combined_raw.contains(": Bad Gateway")
+        || combined_raw.contains("Response: 503 ")
+        || combined_raw.contains(": Service Unavailable")
+        || combined_raw.contains("Response: 504 ")
+        || combined_raw.contains(": Gateway Timeout")
+        || combined_raw.contains("ReadTimeout")
+        || combined_raw.contains("Read timed out")
+        || combined_raw.contains("ConnectTimeout")
+        || combined_raw.contains("Assignment request failed; retrying in")
     {
-        return Err(CoreError::CapacityOrSessionLimit {
-            detail: out.stderr.clone(),
-        });
+        return Err(CoreError::CapacityOrSessionLimit { detail });
     }
 
     Err(CoreError::CommandFailed {
         command: "colab new".to_string(),
         exit_code: out.exit_code,
-        stderr: if out.stderr.is_empty() {
-            out.stdout.clone()
-        } else {
-            out.stderr.clone()
-        },
+        stderr: detail,
     })
 }
 
@@ -328,6 +379,7 @@ pub fn build_new_args(
 ) -> Result<Vec<String>, CoreError> {
     validate_session_name(session_name)?;
     let mut args = vec![
+        "--logtostderr".to_string(),
         "new".to_string(),
         "-s".to_string(),
         session_name.to_string(),
@@ -440,18 +492,42 @@ pub async fn new_session(
     on_line: Option<LineCallback>,
 ) -> Result<(), CoreError> {
     let args = build_new_args(session_name, gpu, high_mem)?;
-    let out = runner
-        .run(
-            colab_spec(
-                colab_bin,
-                args,
-                CLI_NEW_TIMEOUT,
-                COLAB_NEW_REQ_TIMEOUT_SECS,
-                extra_envs,
-            ),
-            on_line,
-        )
-        .await?;
+    let mut spec = colab_spec(
+        colab_bin,
+        args,
+        CLI_NEW_TIMEOUT,
+        COLAB_NEW_REQ_TIMEOUT_SECS,
+        extra_envs,
+    );
+    if !extra_envs
+        .iter()
+        .any(|(k, _)| k == "COLAB_CLI_ASSIGN_RETRIES")
+    {
+        spec.envs.push((
+            "COLAB_CLI_ASSIGN_RETRIES".to_string(),
+            COLAB_NEW_ASSIGN_RETRIES.to_string(),
+        ));
+    }
+    if !extra_envs
+        .iter()
+        .any(|(k, _)| k == "COLAB_CLI_RETRY_BACKOFF")
+    {
+        spec.envs.push((
+            "COLAB_CLI_RETRY_BACKOFF".to_string(),
+            COLAB_NEW_RETRY_BACKOFF_SECS.to_string(),
+        ));
+    }
+
+    let filtered_cb: Option<LineCallback> = on_line.map(|cb| {
+        let wrapped: LineCallback = std::sync::Arc::new(move |line: String| {
+            if should_forward_new_session_log_line(&line) {
+                cb(line);
+            }
+        });
+        wrapped
+    });
+
+    let out = runner.run(spec, filtered_cb).await?;
     parse_new_output(gpu, &out)
 }
 
@@ -704,16 +780,27 @@ mod tests {
                     .unwrap()
                     .pop_front()
                     .expect("unexpected command call");
-                assert_eq!(
-                    spec.args.first().map(String::as_str),
-                    Some(next.expected_subcmd.as_str())
-                );
+                let actual_subcmd = spec
+                    .args
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .map(String::as_str);
+                assert_eq!(actual_subcmd, Some(next.expected_subcmd.as_str()));
                 assert!(matches!(spec.stdin, StdinPolicy::Null));
                 assert!(spec
                     .envs
                     .iter()
                     .any(|(k, v)| k == "PYTHONUNBUFFERED" && v == "1"));
                 let expected_req_timeout = if next.expected_subcmd == "new" {
+                    assert_eq!(spec.args.first().map(String::as_str), Some("--logtostderr"));
+                    assert!(spec
+                        .envs
+                        .iter()
+                        .any(|(k, v)| k == "COLAB_CLI_ASSIGN_RETRIES" && v == "1"));
+                    assert!(spec
+                        .envs
+                        .iter()
+                        .any(|(k, v)| k == "COLAB_CLI_RETRY_BACKOFF" && v == "5"));
                     "120"
                 } else {
                     "30"
@@ -813,6 +900,39 @@ mod tests {
         assert!(matches!(
             parse_new_output(GpuTier::L4, &err_412),
             Err(CoreError::CapacityOrSessionLimit { .. })
+        ));
+
+        for raw_err in [
+            "2026-11-24 21:00:00,000 - colab_cli.client - DEBUG - Response: 503 Service Unavailable\n2026-11-24 21:00:00,001 - colab_cli.client - WARNING - Assignment request failed; retrying in 5s\nColabRequestError: Failed to issue request POST: Service Unavailable",
+            "2026-11-24 21:00:00,000 - colab_cli.client - DEBUG - Response: 504 Gateway Timeout",
+            "requests.exceptions.ReadTimeout: HTTPSConnectionPool(host='colab.research.google.com', port=443): Read timed out.",
+        ] {
+            let out = CommandOutput::from_raw(Some(1), String::new(), raw_err.to_string());
+            match parse_new_output(GpuTier::L4, &out) {
+                Err(CoreError::CapacityOrSessionLimit { detail }) => {
+                    assert!(!detail.contains(" - DEBUG - "));
+                }
+                other => panic!("expected CapacityOrSessionLimit, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn new_session_log_filter_keeps_warnings_and_drops_debug_noise() {
+        assert!(should_forward_new_session_log_line(
+            "[colab] Creating session 'comfy-1234abcd'..."
+        ));
+        assert!(should_forward_new_session_log_line(
+            "2026-11-24 21:00:00,001 - colab_cli.client - WARNING - Assignment request failed; retrying in 5s"
+        ));
+        assert!(should_forward_new_session_log_line(
+            "ColabRequestError: Failed to issue request POST: Service Unavailable"
+        ));
+        assert!(!should_forward_new_session_log_line(
+            "2026-11-24 21:00:00,000 - colab_cli.client - DEBUG - Response Body: )]}'"
+        ));
+        assert!(!should_forward_new_session_log_line(
+            r#"{"endpoint": "m-s-abc123"}"#
         ));
     }
 

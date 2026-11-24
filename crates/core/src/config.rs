@@ -20,6 +20,9 @@ const CONFIG_FILE: &str = "config.json";
 const PENDING_SESSION_FILE: &str = "pending-session.json";
 const ACTIVE_SESSION_FILE: &str = "active-session.json";
 const STATE_LOCK_FILE: &str = "state.lock";
+const APP_LOG_FILE: &str = "app.log";
+const APP_LOG_BACKUP_FILE: &str = "app.log.1";
+pub const MAX_APP_LOG_BYTES: u64 = 512 * 1024;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -297,6 +300,14 @@ pub fn active_session_path(data_dir: &Path) -> PathBuf {
     data_dir.join(ACTIVE_SESSION_FILE)
 }
 
+pub fn app_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(APP_LOG_FILE)
+}
+
+pub fn app_log_backup_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(APP_LOG_BACKUP_FILE)
+}
+
 pub fn load_json_opt<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, CoreError> {
     match fs::read(path) {
         Ok(bytes) => {
@@ -332,6 +343,59 @@ pub fn remove_if_exists(path: &Path) -> Result<(), CoreError> {
             source,
         }),
     }
+}
+
+/// Appends a redacted log line to `<data_dir>/app.log` (`0600`), rotating to `app.log.1` at `MAX_APP_LOG_BYTES`.
+pub fn append_app_log_0600(data_dir: &Path, message: &str) -> Result<(), CoreError> {
+    append_app_log_with_limit(data_dir, message, MAX_APP_LOG_BYTES)
+}
+
+fn append_app_log_with_limit(
+    data_dir: &Path,
+    message: &str,
+    max_bytes: u64,
+) -> Result<(), CoreError> {
+    ensure_data_dirs(data_dir)?;
+    let redacted = crate::runner::redact_sensitive_text(message);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let entry = format!("[{ts}] {}\n", redacted.trim_end_matches('\n'));
+
+    let log_path = app_log_path(data_dir);
+    let backup_path = app_log_backup_path(data_dir);
+    if let Ok(meta) = fs::metadata(&log_path) {
+        if meta.len() > 0 && meta.len().saturating_add(entry.len() as u64) > max_bytes {
+            let _ = fs::rename(&log_path, &backup_path);
+            if backup_path.exists() {
+                let _ = fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&log_path)
+        .map_err(|source| CoreError::Io {
+            context: format!("open app log {}", log_path.display()),
+            source,
+        })?;
+    fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        CoreError::Io {
+            context: format!("chmod 0600 {}", log_path.display()),
+            source,
+        }
+    })?;
+    file.write_all(entry.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|source| CoreError::Io {
+            context: format!("write app log {}", log_path.display()),
+            source,
+        })
 }
 
 #[cfg(test)]
@@ -469,5 +533,38 @@ mod tests {
         assert!(GpuTier::G4.supports_high_mem());
         assert!(GpuTier::A100.supports_high_mem());
         assert!(GpuTier::H100.supports_high_mem());
+    }
+
+    #[test]
+    fn app_log_enforces_0600_redacts_secrets_and_rotates_at_512kib() {
+        let tmp = ShortTempDir::new();
+        append_app_log_0600(
+            &tmp.0,
+            "endpoint m-s-secret999 with Authorization: Bearer ya29.secret_tok",
+        )
+        .unwrap();
+
+        let log_path = app_log_path(&tmp.0);
+        let backup_path = app_log_backup_path(&tmp.0);
+        assert_eq!(
+            fs::metadata(&log_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("[REDACTED_ENDPOINT]"));
+        assert!(content.contains("Bearer [REDACTED]"));
+        assert!(!content.contains("m-s-secret999"));
+        assert!(!content.contains("ya29.secret_tok"));
+
+        let chunk = "a".repeat(200 * 1024);
+        for _ in 0..3 {
+            append_app_log_0600(&tmp.0, &chunk).unwrap();
+        }
+        assert!(backup_path.exists(), "app.log.1 should exist after 512 KiB");
+        assert_eq!(
+            fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::metadata(&log_path).unwrap().len() < MAX_APP_LOG_BYTES);
     }
 }

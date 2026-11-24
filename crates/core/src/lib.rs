@@ -25,15 +25,17 @@ use tokio::task::JoinHandle;
 use crate::bootstrap::{run_remote_bootstrap, BootstrapOutcome};
 use crate::colab_cli::{SessionEntry, SessionStatusLookup, StopReport, UsageInfo};
 use crate::config::{
-    active_session_path, config_path, ctl_socket_path, default_session_name_for_email,
-    ensure_data_dirs, load_json_opt, pending_session_path, remove_if_exists, save_json_0600,
-    validate_session_name, ActiveSession, AppConfig, GpuTier, PendingSession, StateLock,
-    LOCAL_PROXY_PORT, REMOTE_COMFY_PORT,
+    active_session_path, append_app_log_0600, config_path, ctl_socket_path,
+    default_session_name_for_email, ensure_data_dirs, load_json_opt, pending_session_path,
+    remove_if_exists, save_json_0600, validate_session_name, ActiveSession, AppConfig, GpuTier,
+    PendingSession, StateLock, LOCAL_PROXY_PORT, REMOTE_COMFY_PORT,
 };
 use crate::i18n::message_table;
 use crate::local_proxy::{start_local_proxy, LocalProxyHandle};
 use crate::locate::{check_env, resolve_proxy_envs, EnvReport};
-use crate::runner::{CommandRunner, LineCallback, StdinPolicy, TokioCommandRunner};
+use crate::runner::{
+    redact_sensitive_text, CommandRunner, LineCallback, StdinPolicy, TokioCommandRunner,
+};
 use crate::ssh_tunnel::{
     build_mux_exec_spec, start_master_and_verify, stop_master_tunnel, TokioTunnelSpawner,
     TunnelProcess, TunnelSpawner,
@@ -51,7 +53,7 @@ pub enum CoreError {
     #[error("账号暂无 {gpu} 配额或未开通对应订阅：{detail}")]
     NoAcceleratorQuota { gpu: String, detail: String },
 
-    #[error("Colab 拒绝分配实例（可能已达并发上限或当前 GPU 暂时无容量）：{detail}")]
+    #[error("Colab 暂无法分配所选 GPU（可能当前规格容量不足、网关超时或已达并发上限，建议改选 T4 等其他 GPU 重试）：{detail}")]
     CapacityOrSessionLimit { detail: String },
 
     #[error("云端会话 '{session_name}' 已不存在")]
@@ -449,12 +451,18 @@ impl SessionManager {
         let _ = self.snapshot_tx.send(next);
     }
 
+    fn record_ui_error(data_dir: &Path, err: &UiError) {
+        let _ = append_app_log_0600(data_dir, &format!("ERROR [{}] {}", err.code, err.message));
+    }
+
     async fn push_log(&self, line: String) {
+        let redacted = redact_sensitive_text(&line);
+        let _ = append_app_log_0600(&self.data_dir, &redacted);
         let mut guard = self.state.lock().await;
         if guard.logs.len() >= MAX_LOG_LINES {
             guard.logs.pop_front();
         }
-        guard.logs.push_back(line);
+        guard.logs.push_back(redacted);
         drop(guard);
         self.notify_snapshot();
     }
@@ -462,16 +470,20 @@ impl SessionManager {
     fn make_line_callback(&self) -> LineCallback {
         let state = self.state.clone();
         let tx = self.snapshot_tx.clone();
+        let data_dir = self.data_dir.clone();
         Arc::new(move |line: String| {
             let state = state.clone();
             let tx = tx.clone();
+            let data_dir = data_dir.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
+                    let redacted = redact_sensitive_text(&line);
+                    let _ = append_app_log_0600(&data_dir, &redacted);
                     let mut guard = state.lock().await;
                     if guard.logs.len() >= MAX_LOG_LINES {
                         guard.logs.pop_front();
                     }
-                    guard.logs.push_back(line);
+                    guard.logs.push_back(redacted);
                     drop(guard);
                     let next = tx.borrow().wrapping_add(1);
                     let _ = tx.send(next);
@@ -564,8 +576,10 @@ impl SessionManager {
                     });
                 }
                 Err(err) => {
+                    let ui_err = UiError::from(&err);
+                    Self::record_ui_error(&self.data_dir, &ui_err);
                     let mut guard = self.state.lock().await;
-                    guard.last_error = Some((&err).into());
+                    guard.last_error = Some(ui_err);
                 }
             }
         } else if let Some(act) = active {
@@ -622,8 +636,10 @@ impl SessionManager {
                     });
                 }
                 Err(err) => {
+                    let ui_err = UiError::from(&err);
+                    Self::record_ui_error(&self.data_dir, &ui_err);
                     let mut guard = self.state.lock().await;
-                    guard.last_error = Some((&err).into());
+                    guard.last_error = Some(ui_err);
                 }
             }
         }
@@ -656,20 +672,21 @@ impl SessionManager {
                     email
                 }
                 Err(CoreError::AuthRequired { detail }) => {
+                    let ui_err = UiError::from(&CoreError::AuthRequired {
+                        detail: detail.clone(),
+                    });
+                    Self::record_ui_error(&self.data_dir, &ui_err);
                     let mut guard = self.state.lock().await;
                     guard.account_email = None;
                     guard.auth_required = true;
-                    guard.last_error = Some(
-                        (&CoreError::AuthRequired {
-                            detail: detail.clone(),
-                        })
-                            .into(),
-                    );
+                    guard.last_error = Some(ui_err);
                     return Err(CoreError::AuthRequired { detail });
                 }
                 Err(err) => {
+                    let ui_err = UiError::from(&err);
+                    Self::record_ui_error(&self.data_dir, &ui_err);
                     let mut guard = self.state.lock().await;
-                    guard.last_error = Some((&err).into());
+                    guard.last_error = Some(ui_err);
                     return Err(err);
                 }
             };
@@ -682,7 +699,11 @@ impl SessionManager {
         guard.account_email = Some(email);
         match usage_res {
             Ok(u) => guard.usage = Some(u),
-            Err(err) => guard.last_error = Some((&err).into()),
+            Err(err) => {
+                let ui_err = UiError::from(&err);
+                Self::record_ui_error(&self.data_dir, &ui_err);
+                guard.last_error = Some(ui_err);
+            }
         }
         if let Ok(list) = sessions_res {
             guard.orphan_count = list.iter().filter(|s| s.is_orphan).count();
@@ -732,8 +753,10 @@ impl SessionManager {
         if let Err(ref err) = res {
             let mut guard = self.state.lock().await;
             if !matches!(err, CoreError::ZeroBalanceBlocked { .. }) {
+                let ui_err = UiError::from(err);
+                Self::record_ui_error(&self.data_dir, &ui_err);
                 guard.phase = SessionPhase::Error;
-                guard.last_error = Some(err.into());
+                guard.last_error = Some(ui_err);
             } else {
                 guard.phase = SessionPhase::Idle;
                 guard.step = None;
@@ -1188,10 +1211,12 @@ impl SessionManager {
                             | CoreError::SessionLedgerMismatch { .. }
                             | CoreError::AuthRequired { .. }),
                         ) => {
+                            let ui_err = UiError::from(&err);
+                            Self::record_ui_error(&data_dir, &ui_err);
                             let mut guard = state.lock().await;
                             guard.phase = SessionPhase::DisconnectedOrMissing;
                             guard.tunnel_connected = false;
-                            guard.last_error = Some((&err).into());
+                            guard.last_error = Some(ui_err);
                             let _ = snapshot_tx.send(snapshot_tx.borrow().wrapping_add(1));
                             return;
                         }
@@ -1200,13 +1225,15 @@ impl SessionManager {
                 }
 
                 if !reconnected {
+                    let ui_err = UiError {
+                        code: "TUNNEL_RECONNECT_EXHAUSTED".to_string(),
+                        message: "SSH 隧道多次重连失败，请检查网络或手动重连。".to_string(),
+                    };
+                    Self::record_ui_error(&data_dir, &ui_err);
                     let mut guard = state.lock().await;
                     guard.phase = SessionPhase::Error;
                     guard.tunnel_connected = false;
-                    guard.last_error = Some(UiError {
-                        code: "TUNNEL_RECONNECT_EXHAUSTED".to_string(),
-                        message: "SSH 隧道多次重连失败，请检查网络或手动重连。".to_string(),
-                    });
+                    guard.last_error = Some(ui_err);
                     let _ = snapshot_tx.send(snapshot_tx.borrow().wrapping_add(1));
                     break;
                 }

@@ -21,7 +21,7 @@
 
 - 一键开机：支持 `L4`（自动禁用 `High-RAM`）/ `T4` / `G4` / `A100` / `H100`，开机前核查登录态与计算单元余额（0 CU 拦截提示）
 - 安全隧道：通过 `ControlMaster` 单连接复用 + 本地 Unix Socket + 固定 `127.0.0.1:18188` `Host` 校验反向代理访问 ComfyUI（不开放公网穿透，不带 `--enable-cors-header`）
-- 双窗口隔离：`main` 控制台管理开机/重连/停机与脱敏日志；`canvas` 窗口加载本地代理后的 ComfyUI 且没有任何 Tauri IPC 权限
+- 双窗口隔离：`main` 控制台管理开机/重连/停机、开机实时进度与脱敏日志（同步落盘 `~/.colab-comfyui/app.log`，`0600`）；`canvas` 窗口加载本地代理后的 ComfyUI 且没有任何 Tauri IPC 权限
 - 计费防护：两阶段本地账本（`~/.colab-comfyui/`）、启动对账、关窗/退出三选一拦截、停机三重核验与 `[?]` 孤儿实例管理入口
 
 后续阶段计划：
