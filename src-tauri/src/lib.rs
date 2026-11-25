@@ -378,6 +378,107 @@ async fn open_agy_switcher_or_guide(state: tauri::State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
+async fn set_hf_token_secret(
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .set_hf_token_secret(token)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn clear_hf_token_secret(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .clear_hf_token_secret()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn set_sync_preferences(
+    state: tauri::State<'_, AppState>,
+    auto_sync_outputs: Option<bool>,
+    sync_images_dir: Option<String>,
+    sync_videos_dir: Option<String>,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .set_sync_preferences(auto_sync_outputs, sync_images_dir, sync_videos_dir)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn refresh_gallery(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    Ok(state.manager.refresh_gallery().await)
+}
+
+#[tauri::command]
+async fn reveal_gallery_item(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), UiError> {
+    state
+        .manager
+        .reveal_gallery_item(path)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn download_catalog_preset(
+    state: tauri::State<'_, AppState>,
+    preset_id: String,
+    storage: colab_comfy_core::catalog::DownloadTargetStorage,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .download_catalog_preset(preset_id, storage)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn download_custom_hf_model(
+    state: tauri::State<'_, AppState>,
+    input: String,
+    subdir: String,
+    filename_override: Option<String>,
+    storage: colab_comfy_core::catalog::DownloadTargetStorage,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .download_custom_hf_model(input, subdir, filename_override, storage)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn apply_preset_workflow(
+    state: tauri::State<'_, AppState>,
+    preset_id: String,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .apply_preset_workflow(preset_id)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn sync_outputs_now(state: tauri::State<'_, AppState>) -> Result<usize, UiError> {
+    state
+        .manager
+        .sync_outputs_now()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
 async fn stop_and_exit(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -513,6 +614,15 @@ pub fn run() {
             switch_agy_account,
             switch_back_to_owner_account,
             open_agy_switcher_or_guide,
+            set_hf_token_secret,
+            clear_hf_token_secret,
+            set_sync_preferences,
+            refresh_gallery,
+            reveal_gallery_item,
+            download_catalog_preset,
+            download_custom_hf_model,
+            apply_preset_workflow,
+            sync_outputs_now,
             stop_and_exit,
             leave_running_and_exit,
         ])

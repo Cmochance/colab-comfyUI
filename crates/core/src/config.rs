@@ -20,6 +20,7 @@ const CONFIG_FILE: &str = "config.json";
 const PENDING_SESSION_FILE: &str = "pending-session.json";
 const ACTIVE_SESSION_FILE: &str = "active-session.json";
 const STATE_LOCK_FILE: &str = "state.lock";
+const SYNC_CURSOR_FILE: &str = "sync-cursor.json";
 const APP_LOG_FILE: &str = "app.log";
 const APP_LOG_BACKUP_FILE: &str = "app.log.1";
 pub const MAX_APP_LOG_BYTES: u64 = 512 * 1024;
@@ -85,6 +86,12 @@ pub struct AppConfig {
     pub drive_export_timeout_secs: u64,
     #[serde(default = "default_watchdog_idle_minutes")]
     pub watchdog_idle_minutes: Option<u32>,
+    #[serde(default = "default_true")]
+    pub auto_sync_outputs: bool,
+    #[serde(default)]
+    pub sync_images_dir: Option<String>,
+    #[serde(default)]
+    pub sync_videos_dir: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -98,6 +105,9 @@ impl Default for AppConfig {
             privacy_mask: false,
             drive_export_timeout_secs: default_drive_export_timeout_secs(),
             watchdog_idle_minutes: default_watchdog_idle_minutes(),
+            auto_sync_outputs: true,
+            sync_images_dir: None,
+            sync_videos_dir: None,
         }
     }
 }
@@ -131,6 +141,38 @@ pub struct ActiveSession {
     #[serde(default)]
     pub drive_enabled: bool,
     pub created_at_unix: u64,
+}
+
+pub const MAX_SYNC_CURSOR_ENTRIES: usize = 5000;
+
+/// Persistent deduplication cursor for auto-synced ComfyUI outputs (`<data_dir>/sync-cursor.json`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SyncCursor {
+    #[serde(default)]
+    pub synced_keys: Vec<String>,
+}
+
+impl SyncCursor {
+    pub fn contains(&self, prompt_id: &str, filename: &str) -> bool {
+        let key = format!("{prompt_id}:{filename}");
+        self.synced_keys.iter().any(|k| k == &key)
+    }
+
+    pub fn insert(&mut self, prompt_id: &str, filename: &str) {
+        let key = format!("{prompt_id}:{filename}");
+        if self.synced_keys.iter().any(|k| k == &key) {
+            return;
+        }
+        if self.synced_keys.len() >= MAX_SYNC_CURSOR_ENTRIES {
+            let overflow = self.synced_keys.len() + 1 - MAX_SYNC_CURSOR_ENTRIES;
+            self.synced_keys.drain(0..overflow);
+        }
+        self.synced_keys.push(key);
+    }
+}
+
+pub fn sync_cursor_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(SYNC_CURSOR_FILE)
 }
 
 /// Exclusive advisory lock on `<data_dir>/state.lock` opened with `O_CLOEXEC`.

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0（未发布 / unreleased）
+
+### 简体中文
+
+- 新增已核实模型与工作流中心（`catalog.rs`）：内置 `FLUX.1-dev FP8`、`FLUX.1-schnell FP8`、`Wan 2.2 TI2V 5B` 已核实字节数预设与配套工作流模板，并支持自定义 Hugging Face 直链 / `<owner>/<repo>:<file>` 导入。下载前执行显存提示与双盘配额校验（`/content` 与 Drive 均留 2 GiB 余量），先下载至 `/content` 核验字节后再原子拷入 Drive（避免多线程直写 FUSE），并支持存在即跳过与 `aria2c` 实时进度展示。
+- 新增 `HF_TOKEN` 钥匙串安全注入（`hf_keychain.rs`）：仅读写本应用专属钥匙串条目（`io.github.cmochance.colab-comfyui` / `hf_token`），经 `/usr/bin/security -i` stdin 写入，下载时经 `ControlMaster` stdin 喂入 `aria2c --input-file=-`（不进 `argv` 与 `colab exec` 历史），并在设置处诚实声明 Token 会短暂进入远端 VM 内存。
+- 新增成品自动回传与本地作品画廊（`sync.rs`）：监听 `/ws` `executed` 事件并在重连时补扫 `/history`，按 `~/.colab-comfyui/sync-cursor.json` 去重流式保存至 `~/Pictures/ColabComfyUI/` 与 `~/Movies/ColabComfyUI/`；纯 Rust 解析 PNG `tEXt` / `iTXt` 中的 ComfyUI `prompt` 与 `workflow` JSON，支持参数查看、复制 Prompt 与 Finder 显示。
+
+### English
+
+- Added a verified Model & Workflow Catalog (`catalog.rs`): includes verified presets (`FLUX.1-dev FP8`, `FLUX.1-schnell FP8`, `Wan 2.2 TI2V 5B`) with workflow templates plus custom Hugging Face URL / `<owner>/<repo>:<file>` import. Enforces dual-disk 2 GiB quota checks, downloads to `/content` first with byte-size verification before atomic copy to Drive, skips existing files, and streams `aria2c` progress.
+- Added keychain-backed `HF_TOKEN` management (`hf_keychain.rs`): stores `hf_token` via `/usr/bin/security -i` stdin under `io.github.cmochance.colab-comfyui` and injects it via `ControlMaster` stdin to `aria2c --input-file=-` (never in `argv` or `colab exec` history), with an explicit UI notice about VM memory exposure.
+- Added automatic output sync and a pure-Rust PNG metadata gallery (`sync.rs`): listens on `/ws` (`executed`) and reconciles `/history` using `~/.colab-comfyui/sync-cursor.json`, saves images to `~/Pictures/ColabComfyUI/` and videos to `~/Movies/ColabComfyUI/`, and extracts `tEXt`/`iTXt` `prompt` & `workflow` parameters for inspection, prompt copying, and Finder reveal.
+
 ## 0.4.0（未发布 / unreleased）
 
 ### 简体中文
