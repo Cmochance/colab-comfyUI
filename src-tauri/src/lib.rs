@@ -291,10 +291,17 @@ async fn update_preferences(
     use_drive: Option<bool>,
     export_outputs_on_stop: Option<bool>,
     privacy_mask: Option<bool>,
+    drive_export_timeout_secs: Option<u64>,
 ) -> Result<AppSnapshot, UiError> {
     state
         .manager
-        .update_preferences(locale, use_drive, export_outputs_on_stop, privacy_mask)
+        .update_preferences(
+            locale,
+            use_drive,
+            export_outputs_on_stop,
+            privacy_mask,
+            drive_export_timeout_secs,
+        )
         .await
         .map_err(|e| UiError::from(&e))
 }
@@ -345,8 +352,15 @@ pub fn run() {
     let https_proxy = std::env::var_os("HTTPS_PROXY").or_else(|| std::env::var_os("https_proxy"));
     let http_proxy = std::env::var_os("HTTP_PROXY").or_else(|| std::env::var_os("http_proxy"));
 
+    let locale_hint = colab_comfy_core::i18n::detect_locale_from_env(
+        std::env::var("LC_ALL").ok().as_deref(),
+        std::env::var("LC_MESSAGES").ok().as_deref(),
+        std::env::var("LANG").ok().as_deref(),
+    );
+
     let manager = Arc::new(
         SessionManager::new(data_dir.clone(), home_dir.clone(), path_env)
+            .with_locale_hint(locale_hint)
             .with_proxy_hints(https_proxy, http_proxy),
     );
     let allow_immediate_exit = Arc::new(AtomicBool::new(false));

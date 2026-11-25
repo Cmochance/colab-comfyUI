@@ -78,6 +78,7 @@
     auth_url: string | null;
     started_at_unix: number;
     deadline_unix: number;
+    grace_deadline_unix?: number | null;
     attempt: number;
     max_attempts: number;
     status: 'WaitingUser' | 'Continuing' | 'Failed';
@@ -130,6 +131,7 @@
       high_mem: boolean;
       use_drive: boolean;
       export_outputs_on_stop: boolean;
+      drive_export_timeout_secs?: number;
       privacy_mask: boolean;
     };
     account_email: string | null;
@@ -174,6 +176,7 @@
   let highMem = $state(false);
   let useDrive = $state(true);
   let exportOutputsOnStop = $state(true);
+  let driveExportTimeoutSecs = $state(90);
   let privacyMask = $state(false);
   let configSynced = $state(false);
   let starting = $state(false);
@@ -188,6 +191,7 @@
   let actionError = $state<UiError | null>(null);
   let elapsedSecs = $state(0);
   let driveRemainingSecs = $state(0);
+  let driveGraceRemainingSecs = $state(0);
 
   const busy = $derived(starting || stopping || reconnecting || refreshing || exporting || exitBusy);
   const t = (key: string, fallback: string) => snap?.i18n?.[key] ?? fallback;
@@ -251,11 +255,15 @@
     const da = snap?.drive_auth;
     if (!da) {
       driveRemainingSecs = 0;
+      driveGraceRemainingSecs = 0;
       return;
     }
     const updateCountdown = () => {
       const nowSec = Math.floor(Date.now() / 1000);
       driveRemainingSecs = Math.max(0, da.deadline_unix - nowSec);
+      driveGraceRemainingSecs = da.grace_deadline_unix
+        ? Math.max(0, da.grace_deadline_unix - nowSec)
+        : 0;
     };
     updateCountdown();
     const timer = setInterval(updateCountdown, 1000);
@@ -274,6 +282,7 @@
         highMem = s.config.default_gpu !== 'L4' && s.config.high_mem;
         useDrive = s.config.use_drive;
         exportOutputsOnStop = s.config.export_outputs_on_stop;
+        driveExportTimeoutSecs = s.config.drive_export_timeout_secs ?? 90;
         privacyMask = s.config.privacy_mask;
         configSynced = true;
       }
@@ -429,13 +438,15 @@
     useDrive?: boolean;
     exportOutputsOnStop?: boolean;
     privacyMask?: boolean;
+    driveExportTimeoutSecs?: number;
   }) {
     try {
       snap = await invoke<AppSnapshot>('update_preferences', {
         locale: patch.locale ?? null,
         useDrive: patch.useDrive ?? null,
         exportOutputsOnStop: patch.exportOutputsOnStop ?? null,
-        privacyMask: patch.privacyMask ?? null
+        privacyMask: patch.privacyMask ?? null,
+        driveExportTimeoutSecs: patch.driveExportTimeoutSecs ?? null
       });
     } catch (err) {
       actionError = err as UiError;
@@ -489,7 +500,8 @@
   }
 </script>
 
-<main class:masked={privacyMask}>
+<div class="app-shell" class:masked={privacyMask}>
+<main>
   <header class="topbar">
     <div>
       <h1>{t('app_title', 'Colab ComfyUI')}</h1>
@@ -554,12 +566,12 @@
 
   <section class="grid-two">
     <div class="card">
-      <h2>环境与账号</h2>
+      <h2>{t('section_env_account', '环境与账号')}</h2>
       <dl class="kv">
         <dt>colab CLI</dt>
         <dd class="mono sensitive">{snap?.env.colab_path ?? t('env_colab_missing', '未找到 colab')}</dd>
         <dt>OpenSSH</dt>
-        <dd>{snap?.env.ssh_available && snap?.env.ssh_keygen_available ? '可用 (/usr/bin/ssh)' : '缺失'}</dd>
+        <dd>{snap?.env.ssh_available && snap?.env.ssh_keygen_available ? t('env_ssh_available', 'ssh / ssh-keygen 可用') : t('env_ssh_missing', '未找到 /usr/bin/ssh')}</dd>
         <dt>{t('account_label', '当前账号')}</dt>
         <dd class="sensitive">{snap?.account_email ?? t('account_not_signed_in', '未登录')}</dd>
         <dt>{t('balance_label', '计算单元余额')}</dt>
@@ -583,7 +595,7 @@
     </div>
 
     <div class="card">
-      <h2>会话与 GPU 配置</h2>
+      <h2>{t('section_session_config', '会话配置')}</h2>
       <div class="form-row">
         <label for="gpu-select">{t('gpu_label', 'GPU 规格')}</label>
         <select
@@ -631,16 +643,29 @@
           {t('export_outputs_label', '停机时导出 output/ 成品到 Drive')}
         </label>
       </div>
+      <div class="form-row">
+        <label for="export-timeout-input">{t('export_timeout_label', '停机导出超时 (秒)')}</label>
+        <input
+          id="export-timeout-input"
+          type="number"
+          min="15"
+          max="1800"
+          step="15"
+          bind:value={driveExportTimeoutSecs}
+          onchange={() => savePreferences({ driveExportTimeoutSecs })}
+          disabled={stopping}
+        />
+      </div>
       {#if snap?.active_session}
         <div class="session-meta">
-          <span>会话: <code class="sensitive">{snap.active_session.session_name}</code></span>
-          <span class="sensitive">硬件: {snap.active_session.hardware_summary}</span>
-          <span>本地代理: <code>127.0.0.1:{snap.active_session.local_port}</code></span>
+          <span>{t('session_label', '当前会话')}: <code class="sensitive">{snap.active_session.session_name}</code></span>
+          <span class="sensitive">{t('hardware_label', '硬件')}: {snap.active_session.hardware_summary}</span>
+          <span>{t('local_proxy_label', '本地代理')}: <code>127.0.0.1:{snap.active_session.local_port}</code></span>
           <span>Drive: {snap.active_session.drive_enabled ? 'ON' : 'OFF'}</span>
         </div>
       {:else if snap?.pending_session}
         <div class="session-meta">
-          <span>待核对会话: <code class="sensitive">{snap.pending_session.session_name}</code></span>
+          <span>{t('pending_session_label', '待完成会话')}: <code class="sensitive">{snap.pending_session.session_name}</code></span>
           <span>GPU: {snap.pending_session.gpu}</span>
         </div>
       {/if}
@@ -662,7 +687,7 @@
       {#if snap?.phase === 'Starting'}
         <button class="danger" onclick={runCancelStart} disabled={stopping}>
           {snap?.active_session
-            ? '取消开机并立即停机'
+            ? t('btn_cancel_and_stop', '取消并停机')
             : t('btn_cancel_start', '取消开机（等待分配后停机）')}
         </button>
       {/if}
@@ -824,7 +849,7 @@
       {logsExpanded ? '▼' : '▶'} {t('logs_title', '运行日志（已脱敏）')} ({snap?.logs.length ?? 0})
     </button>
     {#if logsExpanded}
-      <pre class="log-box">{snap?.logs.length ? snap.logs.join('\n') : t('logs_empty', '暂无日志')}</pre>
+      <pre class="log-box sensitive">{snap?.logs.length ? snap.logs.join('\n') : t('logs_empty', '暂无日志')}</pre>
     {/if}
   </section>
 </main>
@@ -837,12 +862,19 @@
       {#if snap.drive_auth.auth_url}
         <p class="mono url-preview sensitive">{snap.drive_auth.auth_url}</p>
       {/if}
-      <p class="hint">
-        {t('drive_auth_countdown', '剩余等待时间：{secs}s（第 {attempt}/{max} 次）')
-          .replace('{secs}', String(driveRemainingSecs))
-          .replace('{attempt}', String(snap.drive_auth.attempt))
-          .replace('{max}', String(snap.drive_auth.max_attempts))}
-      </p>
+      {#if snap.drive_auth.status === 'Failed' && snap.drive_auth.grace_deadline_unix}
+        <p class="hint">
+          {t('drive_grace_countdown', '挂载失败，{secs}s 后将自动降级为无 Drive 模式继续启动（可重试、跳过或取消并停机）')
+            .replace('{secs}', String(driveGraceRemainingSecs))}
+        </p>
+      {:else}
+        <p class="hint">
+          {t('drive_auth_countdown', '剩余等待时间：{secs}s（第 {attempt}/{max} 次）')
+            .replace('{secs}', String(driveRemainingSecs))
+            .replace('{attempt}', String(snap.drive_auth.attempt))
+            .replace('{max}', String(snap.drive_auth.max_attempts))}
+        </p>
+      {/if}
       {#if snap.drive_auth.message}
         <p class="banner warn">{snap.drive_auth.message}</p>
       {/if}
@@ -867,6 +899,9 @@
         {/if}
         <button class="secondary" onclick={runSkipDriveForSession}>
           {t('drive_auth_skip', '跳过 Drive（本次无持久化继续）')}
+        </button>
+        <button class="danger" onclick={runCancelStart} disabled={stopping}>
+          {t('btn_cancel_and_stop', '取消并停机')}
         </button>
       </div>
     </div>
@@ -910,6 +945,7 @@
     </div>
   </div>
 {/if}
+</div>
 
 <style>
   :global(body) {
@@ -1256,7 +1292,7 @@
     border-radius: 6px;
   }
 
-  main.masked .sensitive {
+  .app-shell.masked .sensitive {
     filter: blur(5px);
     user-select: none;
   }

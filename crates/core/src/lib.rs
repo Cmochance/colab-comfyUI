@@ -34,13 +34,13 @@ use crate::config::{
     remove_if_exists, save_json_0600, validate_session_name, ActiveSession, AppConfig, GpuTier,
     PendingSession, StateLock, LOCAL_PROXY_PORT, REMOTE_COMFY_PORT,
 };
-use crate::i18n::{detect_system_locale, message_table, Locale};
+use crate::i18n::{message_table, Locale};
 use crate::local_proxy::{start_local_proxy, LocalProxyHandle};
 use crate::locate::{check_env, resolve_proxy_envs, EnvReport};
 use crate::persistence::{
-    check_drive_mounted_mux, drivemount_args, extract_drive_auth_url, is_drive_auth_prompt_line,
-    run_remote_export_and_flush, DriveAuthPrompt, DriveAuthStatus, DriveExportReport,
-    DrivemountSpawner, TokioDrivemountSpawner, DRIVE_AUTH_TIMEOUT, DRIVE_EXPORT_TIMEOUT,
+    check_drive_mounted_mux, drivemount_args, run_remote_export_and_flush, DriveAuthPrompt,
+    DriveAuthStatus, DriveExportReport, DrivemountLine, DrivemountSpawner, MountProbe,
+    TokioDrivemountSpawner, DRIVE_AUTH_TIMEOUT, DRIVE_FAILED_GRACE_TIMEOUT,
     MAX_DRIVE_MOUNT_ATTEMPTS,
 };
 use crate::runner::{
@@ -460,10 +460,7 @@ impl SessionManager {
         let config: AppConfig = load_json_opt(&config_path(&data_dir))
             .ok()
             .flatten()
-            .unwrap_or_else(|| AppConfig {
-                locale: detect_system_locale(),
-                ..AppConfig::default()
-            });
+            .unwrap_or_default();
         let ledgers = load_ledgers_checked(&data_dir);
         let ledger_corrupted = ledgers.corruption_error.is_some();
         if let Some(ref err) = ledgers.corruption_error {
@@ -539,6 +536,19 @@ impl SessionManager {
 
     pub fn with_drivemount_spawner(mut self, spawner: Arc<dyn DrivemountSpawner>) -> Self {
         self.drivemount_spawner = spawner;
+        self
+    }
+
+    pub fn with_locale_hint(self, locale: Locale) -> Self {
+        if load_json_opt::<AppConfig>(&config_path(&self.data_dir))
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            if let Ok(mut guard) = self.state.try_lock() {
+                guard.config.locale = locale;
+            }
+        }
         self
     }
 
@@ -632,6 +642,7 @@ impl SessionManager {
         use_drive: Option<bool>,
         export_outputs_on_stop: Option<bool>,
         privacy_mask: Option<bool>,
+        drive_export_timeout_secs: Option<u64>,
     ) -> Result<AppSnapshot, CoreError> {
         {
             let mut guard = self.state.lock().await;
@@ -646,6 +657,9 @@ impl SessionManager {
             }
             if let Some(p) = privacy_mask {
                 guard.config.privacy_mask = p;
+            }
+            if let Some(secs) = drive_export_timeout_secs {
+                guard.config.drive_export_timeout_secs = secs.clamp(15, 1800);
             }
             save_json_0600(&config_path(&self.data_dir), &guard.config)?;
         }
@@ -695,8 +709,18 @@ impl SessionManager {
         .ok_or_else(|| CoreError::TunnelFailed {
             detail: "当前没有已连接的 SSH 隧道，无法导出到 Drive".to_string(),
         })?;
-        let report =
-            run_remote_export_and_flush(&ctl_sock, include_outputs, self.runner.as_ref()).await?;
+        let timeout_secs = {
+            let guard = self.state.lock().await;
+            guard.config.drive_export_timeout_secs.clamp(15, 1800)
+        };
+        let report = run_remote_export_and_flush(
+            &ctl_sock,
+            include_outputs,
+            false,
+            Duration::from_secs(timeout_secs),
+            self.runner.as_ref(),
+        )
+        .await?;
         self.push_log(report.summary.clone()).await;
         {
             let mut guard = self.state.lock().await;
@@ -1900,8 +1924,23 @@ impl SessionManager {
                     if !mounted {
                         let mut updated = active.clone();
                         updated.drive_enabled = false;
-                        if let Ok(_lock) = StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await {
-                            let _ = save_json_0600(&active_session_path(&self.data_dir), &updated);
+                        match StateLock::acquire(&self.data_dir, LOCK_TIMEOUT).await {
+                            Ok(_lock) => {
+                                if let Err(err) =
+                                    save_json_0600(&active_session_path(&self.data_dir), &updated)
+                                {
+                                    self.push_log(format!(
+                                        "告警：更新本地账本 drive_enabled=false 失败（{err}）"
+                                    ))
+                                    .await;
+                                }
+                            }
+                            Err(err) => {
+                                self.push_log(format!(
+                                    "告警：获取本地账本锁失败，未能写入 drive_enabled=false（{err}）"
+                                ))
+                                .await;
+                            }
                         }
                         let mut guard = self.state.lock().await;
                         guard.active_session = Some(updated);
@@ -1958,17 +1997,34 @@ impl SessionManager {
                 Ok(BootstrapOutcome {
                     cors_header_busy_warning,
                     layout_changed_busy_warning,
+                    failed_custom_nodes,
+                    constraint_fallback_warning,
                 }) => {
+                    let mut warnings = Vec::new();
                     if cors_header_busy_warning {
+                        warnings.push("检测到旧 ComfyUI 进程带 --enable-cors-header 且队列非空，请在任务结束后重启以恢复同源保护。".to_string());
+                    }
+                    if layout_changed_busy_warning {
+                        warnings.push("Drive 持久化目录或 extra_model_paths.yaml 已变更，但当前 ComfyUI 队列非空，请在任务结束后重启以生效。".to_string());
+                    }
+                    if !failed_custom_nodes.is_empty() {
+                        warnings.push(format!(
+                            "部分自定义节点恢复失败（已跳过）：{}。",
+                            failed_custom_nodes.join(", ")
+                        ));
+                    }
+                    if constraint_fallback_warning {
+                        warnings.push("部分自定义节点依赖与 Colab 非核心约束冲突，已自动降级为仅锁定 PyTorch/CUDA 约束继续安装。".to_string());
+                    }
+                    if !warnings.is_empty() {
+                        let joined = warnings.join(" ");
+                        self.push_log(format!("告警：{joined}")).await;
                         let mut guard = self.state.lock().await;
-                        guard.warning_banner = Some(
-                            "检测到旧 ComfyUI 进程带 --enable-cors-header 且队列非空，请在任务结束后重启以恢复同源保护。".to_string(),
-                        );
-                    } else if layout_changed_busy_warning {
-                        let mut guard = self.state.lock().await;
-                        guard.warning_banner = Some(
-                            "Drive 持久化目录或 extra_model_paths.yaml 已变更，但当前 ComfyUI 队列非空，请在任务结束后重启以生效。".to_string(),
-                        );
+                        if let Some(prev) = guard.warning_banner.take() {
+                            guard.warning_banner = Some(format!("{prev} {joined}"));
+                        } else {
+                            guard.warning_banner = Some(joined);
+                        }
                     }
                 }
                 Err(err) => {
@@ -2017,9 +2073,22 @@ impl SessionManager {
     ) -> Result<bool, CoreError> {
         // P1-11: verify `colab whoami` before invoking `colab drivemount`.
         let _ = colab_cli::whoami(self.runner.as_ref(), colab_bin, proxy_envs, None).await?;
-        if check_drive_mounted_mux(ctl_sock, self.runner.as_ref()).await? {
-            self.push_log("Google Drive 已挂载。".to_string()).await;
-            return Ok(true);
+        match check_drive_mounted_mux(ctl_sock, self.runner.as_ref()).await? {
+            MountProbe::MountedHealthy => {
+                self.push_log("Google Drive 已挂载。".to_string()).await;
+                return Ok(true);
+            }
+            MountProbe::MountedUnhealthy => {
+                self.push_log(
+                    "告警：/content/drive 已出现在挂载表中，但 MyDrive 不可访问。".to_string(),
+                )
+                .await;
+                return Err(CoreError::BootstrapFailed {
+                    detail: "Google Drive 挂载点已存在但状态异常，请先停机或检查 /content/drive"
+                        .to_string(),
+                });
+            }
+            MountProbe::NotMounted => {}
         }
 
         self.push_log("正在挂载 Google Drive（零 Token 上云）...".to_string())
@@ -2055,7 +2124,7 @@ impl SessionManager {
                 }
 
                 enum DriveLoopEvent {
-                    Line(Option<String>),
+                    Line(Option<DrivemountLine>),
                     Action,
                     Cancelled,
                     Timeout,
@@ -2092,16 +2161,17 @@ impl SessionManager {
 
                 match ev {
                     DriveLoopEvent::Line(Some(line)) => {
-                        self.push_log(line.clone()).await;
-                        if let Some(u) = extract_drive_auth_url(&line) {
+                        self.push_log(line.redacted.clone()).await;
+                        if let Some(u) = line.auth_url {
                             auth_url = Some(u);
                         }
-                        if auth_url.is_some() || is_drive_auth_prompt_line(&line) {
+                        if auth_url.is_some() || line.is_auth_prompt {
                             let mut guard = self.state.lock().await;
                             guard.drive_auth = Some(DriveAuthPrompt {
                                 auth_url: auth_url.clone(),
                                 started_at_unix: started_unix,
                                 deadline_unix: started_unix + DRIVE_AUTH_TIMEOUT.as_secs(),
+                                grace_deadline_unix: None,
                                 attempt,
                                 max_attempts: MAX_DRIVE_MOUNT_ATTEMPTS,
                                 status: DriveAuthStatus::WaitingUser,
@@ -2151,10 +2221,10 @@ impl SessionManager {
             }
 
             let _ = proc.wait().await;
-            if check_drive_mounted_mux(ctl_sock, self.runner.as_ref())
-                .await
-                .unwrap_or(false)
-            {
+            if matches!(
+                check_drive_mounted_mux(ctl_sock, self.runner.as_ref()).await,
+                Ok(MountProbe::MountedHealthy)
+            ) {
                 let mut guard = self.state.lock().await;
                 guard.drive_auth = None;
                 drop(guard);
@@ -2164,13 +2234,18 @@ impl SessionManager {
                 return Ok(true);
             }
 
+            let grace_deadline_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + DRIVE_FAILED_GRACE_TIMEOUT.as_secs();
             let msg = if attempt < MAX_DRIVE_MOUNT_ATTEMPTS {
                 format!(
-                    "Google Drive 第 {attempt}/{MAX_DRIVE_MOUNT_ATTEMPTS} 次挂载未成功，可点击「重试挂载」或「跳过 Drive」。"
+                    "Google Drive 第 {attempt}/{MAX_DRIVE_MOUNT_ATTEMPTS} 次挂载未成功，可点击「重试挂载」、「跳过 Drive」或「取消并停机」（120s 后将自动降级为无 Drive 模式）。"
                 )
             } else {
                 format!(
-                    "Google Drive 已达最大重试次数（{MAX_DRIVE_MOUNT_ATTEMPTS}/{MAX_DRIVE_MOUNT_ATTEMPTS}），请跳过 Drive 继续或停机重试。"
+                    "Google Drive 已达最大重试次数（{MAX_DRIVE_MOUNT_ATTEMPTS}/{MAX_DRIVE_MOUNT_ATTEMPTS}），120s 后将自动降级为无 Drive 模式，也可立即跳过或取消并停机。"
                 )
             };
             {
@@ -2179,6 +2254,7 @@ impl SessionManager {
                     auth_url: auth_url.clone(),
                     started_at_unix: started_unix,
                     deadline_unix: started_unix + DRIVE_AUTH_TIMEOUT.as_secs(),
+                    grace_deadline_unix: Some(grace_deadline_unix),
                     attempt,
                     max_attempts: MAX_DRIVE_MOUNT_ATTEMPTS,
                     status: DriveAuthStatus::Failed,
@@ -2187,16 +2263,19 @@ impl SessionManager {
             }
             self.notify_snapshot();
 
-            // Wait for user decision: Retry (if attempts left), Skip, or Cancel.
+            // Wait for user decision: Retry (if attempts left), Skip, Cancel, or 120s grace timeout (M2-A).
             self.drive_action_tx.send_replace(None);
             let mut wait_action = self.drive_action_tx.subscribe();
+            let grace_deadline = tokio::time::Instant::now() + DRIVE_FAILED_GRACE_TIMEOUT;
             loop {
                 enum DriveRetryEvent {
                     Action,
                     Cancelled,
+                    GraceTimeout,
                 }
                 let ev = {
                     let mut action_fut = std::pin::pin!(wait_action.changed());
+                    let mut grace_fut = std::pin::pin!(tokio::time::sleep_until(grace_deadline));
                     let mut cancel_fut = std::pin::pin!(async {
                         if let Some(ref mut crx) = cancel_sub {
                             let _ = crx.wait_for(|&c| c).await;
@@ -2210,6 +2289,9 @@ impl SessionManager {
                         }
                         if action_fut.as_mut().poll(cx).is_ready() {
                             return Poll::Ready(DriveRetryEvent::Action);
+                        }
+                        if grace_fut.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(DriveRetryEvent::GraceTimeout);
                         }
                         Poll::Pending
                     })
@@ -2230,6 +2312,17 @@ impl SessionManager {
                             }
                             _ => {}
                         }
+                    }
+                    DriveRetryEvent::GraceTimeout => {
+                        self.push_log(
+                            "Google Drive 挂载宽限期已到（120s），自动降级为无 Drive 模式继续启动。"
+                                .to_string(),
+                        )
+                        .await;
+                        let mut guard = self.state.lock().await;
+                        guard.drive_auth = None;
+                        self.notify_snapshot();
+                        return Ok(false);
                     }
                     DriveRetryEvent::Cancelled => {
                         let mut guard = self.state.lock().await;
@@ -2264,6 +2357,7 @@ impl SessionManager {
         let task = tokio::spawn(async move {
             let mut tick: u64 = 0;
             let mut interval = tokio::time::interval(TELEMETRY_LOCAL_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
                 if intentional_stop.load(Ordering::SeqCst) {
@@ -2596,9 +2690,18 @@ impl SessionManager {
         let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
         let colab_bin = self.require_colab_bin(&env)?;
 
-        let (session_name, owner_email, endpoint_sha256, drive_enabled, export_outputs, target) = {
+        let (
+            session_name,
+            owner_email,
+            endpoint_sha256,
+            drive_enabled,
+            export_outputs,
+            export_timeout_secs,
+            target,
+        ) = {
             let guard = self.state.lock().await;
             let export_outputs = guard.config.export_outputs_on_stop;
+            let export_timeout_secs = guard.config.drive_export_timeout_secs.clamp(15, 1800);
             if let Some(ref act) = guard.active_session {
                 (
                     act.session_name.clone(),
@@ -2606,6 +2709,7 @@ impl SessionManager {
                     Some(act.endpoint_sha256.clone()),
                     act.drive_enabled,
                     export_outputs,
+                    export_timeout_secs,
                     VerifiedLedgerTarget::Active {
                         session_name: act.session_name.clone(),
                         owner_email: act.owner_email.clone(),
@@ -2618,6 +2722,7 @@ impl SessionManager {
                     None,
                     false,
                     export_outputs,
+                    export_timeout_secs,
                     VerifiedLedgerTarget::Pending {
                         session_name: pend.session_name.clone(),
                         owner_email: pend.owner_email.clone(),
@@ -2638,50 +2743,92 @@ impl SessionManager {
         }
         self.notify_snapshot();
 
-        // Non-blocking pre-stop Drive export & flush_and_unmount() (P1-10):
+        // Non-blocking pre-stop Drive export & flush_and_unmount() (P1-10, H3, L7, M3-A):
         // Never blocks `colab stop` if export/flush fails or times out.
         let mut drive_sync_confirmed: Option<bool> = None;
         if drive_enabled {
-            let ctl_sock = { self.handles.lock().await.ctl_sock.clone() };
-            if let Some(ctl) = ctl_sock {
-                self.push_log(
-                    "停机前正在导出工作流到 Drive 并执行 flush_and_unmount()...".to_string(),
-                )
-                .await;
-                match tokio::time::timeout(
-                    DRIVE_EXPORT_TIMEOUT,
-                    run_remote_export_and_flush(&ctl, export_outputs, self.runner.as_ref()),
-                )
-                .await
-                {
-                    Ok(Ok(exp)) if exp.ok && exp.flush_ok => {
-                        drive_sync_confirmed = Some(true);
-                        self.push_log(exp.summary.clone()).await;
-                        let mut guard = self.state.lock().await;
-                        guard.last_export_report = Some(exp);
-                    }
-                    Ok(Ok(exp)) => {
-                        drive_sync_confirmed = Some(false);
-                        self.push_log(format!("告警：{}（继续停机）", exp.summary))
+            let proxy_envs = resolve_proxy_envs(
+                self.runner.as_ref(),
+                self.proxy_http_hint.as_deref(),
+                self.proxy_https_hint.as_deref(),
+            )
+            .await;
+            let account_matches = match colab_cli::whoami(
+                self.runner.as_ref(),
+                &colab_bin,
+                &proxy_envs,
+                None,
+            )
+            .await
+            {
+                Ok(current_email) if current_email != owner_email => {
+                    self.push_log(format!(
+                        "告警：当前登录账号（{current_email}）与会话所属账号（{owner_email}）不一致，跳过停机前 Drive 导出，继续执行停机。"
+                    ))
+                    .await;
+                    false
+                }
+                Ok(_) => true,
+                Err(_) => true,
+            };
+
+            if !account_matches {
+                drive_sync_confirmed = Some(false);
+            } else {
+                let ctl_sock = { self.handles.lock().await.ctl_sock.clone() };
+                if let Some(ctl) = ctl_sock {
+                    self.push_log(
+                        "停机前正在导出工作流到 Drive 并执行 flush_and_unmount()...".to_string(),
+                    )
+                    .await;
+                    let timeout_dur = Duration::from_secs(export_timeout_secs);
+                    match tokio::time::timeout(
+                        timeout_dur,
+                        run_remote_export_and_flush(
+                            &ctl,
+                            export_outputs,
+                            true,
+                            timeout_dur,
+                            self.runner.as_ref(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(exp)) if exp.ok && exp.flush_ok => {
+                            drive_sync_confirmed = Some(true);
+                            self.push_log(exp.summary.clone()).await;
+                            let mut guard = self.state.lock().await;
+                            guard.last_export_report = Some(exp);
+                        }
+                        Ok(Ok(exp)) => {
+                            drive_sync_confirmed = Some(false);
+                            self.push_log(format!("告警：{}（继续停机）", exp.summary))
+                                .await;
+                            let mut guard = self.state.lock().await;
+                            guard.last_export_report = Some(exp);
+                        }
+                        Ok(Err(err)) => {
+                            drive_sync_confirmed = Some(false);
+                            self.push_log(format!(
+                                "告警：停机前 Drive 导出失败（{err}），Drive 同步未确认，继续执行停机。"
+                            ))
                             .await;
-                        let mut guard = self.state.lock().await;
-                        guard.last_export_report = Some(exp);
+                        }
+                        Err(_) => {
+                            drive_sync_confirmed = Some(false);
+                            self.push_log(format!(
+                                "告警：停机前 Drive 导出/刷盘超时（{export_timeout_secs}s），Drive 同步未确认，继续执行停机以防烧算力。"
+                            ))
+                            .await;
+                        }
                     }
-                    Ok(Err(err)) => {
-                        drive_sync_confirmed = Some(false);
-                        self.push_log(format!(
-                            "告警：停机前 Drive 导出失败（{err}），Drive 同步未确认，继续执行停机。"
-                        ))
-                        .await;
-                    }
-                    Err(_) => {
-                        drive_sync_confirmed = Some(false);
-                        self.push_log(
-                            "告警：停机前 Drive 导出/刷盘超时（90s），Drive 同步未确认，继续执行停机以防烧算力。"
-                                .to_string(),
-                        )
-                        .await;
-                    }
+                } else {
+                    drive_sync_confirmed = Some(false);
+                    self.push_log(
+                        "告警：当前无活跃 SSH 隧道，已跳过停机前 Drive 导出与刷盘（Drive 同步未确认），继续执行停机。"
+                            .to_string(),
+                    )
+                    .await;
                 }
             }
         }
@@ -3173,7 +3320,9 @@ mod tests {
         fs::write(crate::config::ssh_pub_key_path(&data), "pub").unwrap();
 
         block_on(async {
-            let _ = mgr.update_preferences(None, Some(false), None, None).await;
+            let _ = mgr
+                .update_preferences(None, Some(false), None, None, None)
+                .await;
             let mut rx = mgr.subscribe();
             let snap = mgr.start_session(GpuTier::T4, false, false).await.unwrap();
             assert_eq!(snap.phase, SessionPhase::Ready);
@@ -3290,7 +3439,9 @@ mod tests {
         fs::write(crate::config::ssh_pub_key_path(&data), "pub").unwrap();
 
         block_on(async {
-            let _ = mgr.update_preferences(None, Some(false), None, None).await;
+            let _ = mgr
+                .update_preferences(None, Some(false), None, None, None)
+                .await;
             let mgr_start = mgr.clone();
             let handle =
                 tokio::spawn(
@@ -3658,7 +3809,9 @@ mod tests {
         fs::write(crate::config::ssh_pub_key_path(&data), "pub").unwrap();
 
         block_on(async {
-            let _ = mgr.update_preferences(None, Some(false), None, None).await;
+            let _ = mgr
+                .update_preferences(None, Some(false), None, None, None)
+                .await;
             let mgr_start = mgr.clone();
             let handle =
                 tokio::spawn(
@@ -4209,8 +4362,13 @@ mod tests {
     }
 
     impl crate::persistence::DrivemountProcess for MockDrivemountProc {
-        fn next_line<'a>(&'a mut self) -> BoxFuture<'a, Option<String>> {
-            Box::pin(async move { self.rx.recv().await })
+        fn next_line<'a>(&'a mut self) -> BoxFuture<'a, Option<DrivemountLine>> {
+            Box::pin(async move {
+                self.rx
+                    .recv()
+                    .await
+                    .map(|raw| crate::persistence::parse_drivemount_line(&raw))
+            })
         }
         fn send_newline<'a>(&'a mut self) -> BoxFuture<'a, Result<(), CoreError>> {
             Box::pin(async move {
@@ -4304,11 +4462,11 @@ mod tests {
                         if args.iter().any(|a| a == "bash -s") {
                             if let Some(ref b) = stdin_bytes {
                                 let script = String::from_utf8_lossy(b);
-                                if script.contains("print('DRIVE_MOUNTED='") {
+                                if script.contains("DRIVE_PROBE=") {
                                     let out = if dm_flag.load(Ordering::SeqCst) {
-                                        "DRIVE_MOUNTED=1\n"
+                                        "DRIVE_PROBE=MOUNTED_HEALTHY\n"
                                     } else {
-                                        "DRIVE_MOUNTED=0\n"
+                                        "DRIVE_PROBE=NOT_MOUNTED\n"
                                     };
                                     return Ok(CommandOutput::from_raw(
                                         Some(0),
@@ -4457,10 +4615,10 @@ mod tests {
                         if args.iter().any(|a| a == "bash -s") {
                             if let Some(ref b) = stdin_bytes {
                                 let script = String::from_utf8_lossy(b);
-                                if script.contains("print('DRIVE_MOUNTED='") {
+                                if script.contains("DRIVE_PROBE=") {
                                     return Ok(CommandOutput::from_raw(
                                         Some(0),
-                                        "DRIVE_MOUNTED=0\n".to_string(),
+                                        "DRIVE_PROBE=NOT_MOUNTED\n".to_string(),
                                         String::new(),
                                     ));
                                 }
@@ -4561,6 +4719,123 @@ mod tests {
             assert_eq!(snap.phase, SessionPhase::Ready);
             assert!(!snap.active_session.as_ref().unwrap().drive_enabled);
             assert_eq!(spawns.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn manual_export_does_not_unmount_and_stop_without_tunnel_warns() {
+        let tmp = ShortTempDir::new();
+        let data = tmp.0.join("d");
+        let home = tmp.0.join("h");
+        install_fake_colab(&home);
+
+        let sname = default_session_name_for_email("alice@example.com");
+        let script_seen_unmount = Arc::new(StdMutex::new(Vec::<bool>::new()));
+        let seen_clone = script_seen_unmount.clone();
+        let drive_mounted = Arc::new(AtomicBool::new(true));
+
+        let runner: Arc<dyn CommandRunner> = Arc::new(SmartRunner {
+            responder: Box::new(move |spec| {
+                let sname = sname.clone();
+                let seen_clone = seen_clone.clone();
+                let dm_flag = drive_mounted.clone();
+                let prog = spec.program.clone();
+                let args = spec.args.clone();
+                let stdin_bytes = match &spec.stdin {
+                    StdinPolicy::Bytes(b) => Some(b.clone()),
+                    StdinPolicy::Null => None,
+                };
+                Box::pin(async move {
+                    if prog == Path::new(crate::locate::SCUTIL_BIN)
+                        || prog == Path::new(crate::locate::SSH_KEYGEN_BIN)
+                    {
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    if prog == Path::new(crate::locate::SSH_BIN) {
+                        if args.iter().any(|a| a == "bash -s") {
+                            if let Some(ref b) = stdin_bytes {
+                                let script = String::from_utf8_lossy(b);
+                                if script.contains("DRIVE_PROBE=") {
+                                    let out = if dm_flag.load(Ordering::SeqCst) {
+                                        "DRIVE_PROBE=MOUNTED_HEALTHY\n"
+                                    } else {
+                                        "DRIVE_PROBE=NOT_MOUNTED\n"
+                                    };
+                                    return Ok(CommandOutput::from_raw(
+                                        Some(0),
+                                        out.to_string(),
+                                        String::new(),
+                                    ));
+                                }
+                                if script.contains("EXPORT_OK=1") {
+                                    seen_clone
+                                        .lock()
+                                        .unwrap()
+                                        .push(script.contains("UNMOUNT_DRIVE = True"));
+                                    return Ok(CommandOutput::from_raw(
+                                        Some(0),
+                                        "FLUSH_OK=1\nEXPORT_OK=1\n".to_string(),
+                                        String::new(),
+                                    ));
+                                }
+                            }
+                            return Ok(CommandOutput::from_raw(
+                                Some(0),
+                                format!("{}\n", crate::bootstrap::COMFY_READY_SENTINEL),
+                                String::new(),
+                            ));
+                        }
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let sub = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .map(String::as_str);
+                    let out = match sub {
+                        Some("whoami") => "Email: alice@example.com\n".to_string(),
+                        Some("usage") => "Current balance: 10.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0".to_string(),
+                        Some("status") => format!("[{sname}] m-s-drv2 | Hardware: NVIDIA T4 | Shape: Standard | Variant: GPU"),
+                        Some("sessions") => "[colab] No active sessions found on server.".to_string(),
+                        Some("stop") => "[colab] Session terminated.".to_string(),
+                        _ => String::new(),
+                    };
+                    Ok(CommandOutput::from_raw(Some(0), out, String::new()))
+                })
+            }),
+        });
+
+        let mgr = Arc::new(SessionManager::with_deps(
+            data.clone(),
+            Some(home),
+            Some(OsString::from("/usr/bin:/bin")),
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        ));
+        fs::write(crate::config::ssh_key_path(&data), "priv").unwrap();
+        fs::write(crate::config::ssh_pub_key_path(&data), "pub").unwrap();
+
+        block_on(async {
+            let snap = mgr.start_session(GpuTier::T4, false, false).await.unwrap();
+            assert_eq!(snap.phase, SessionPhase::Ready);
+
+            // H2: manual export uses os.sync() and does NOT call flush_and_unmount()
+            let rep = mgr.export_to_drive_now(false).await.unwrap();
+            assert!(rep.ok && rep.flush_ok && !rep.unmounted);
+            assert_eq!(*script_seen_unmount.lock().unwrap(), vec![false]);
+
+            // H3: simulate disconnected tunnel on stop -> drive_sync_confirmed = Some(false)
+            mgr.teardown_local_handles().await;
+            let stop_rep = mgr.stop_session().await.unwrap();
+            assert_eq!(stop_rep.drive_sync_confirmed, Some(false));
         });
     }
 }

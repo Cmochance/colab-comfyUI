@@ -8,12 +8,16 @@ use crate::CoreError;
 pub const COMFY_READY_SENTINEL: &str = "COMFY_READY=1";
 pub const CORS_HEADER_BUSY_SENTINEL: &str = "CORS_HEADER_ACTIVE_QUEUE_BUSY=1";
 pub const LAYOUT_CHANGED_BUSY_SENTINEL: &str = "PERSISTENCE_LAYOUT_CHANGED_BUSY=1";
+pub const CUSTOM_NODES_FAILED_PREFIX: &str = "CUSTOM_NODES_FAILED=";
+pub const CONSTRAINT_FALLBACK_SENTINEL: &str = "CONSTRAINT_FALLBACK=1";
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapOutcome {
     pub cors_header_busy_warning: bool,
     pub layout_changed_busy_warning: bool,
+    pub failed_custom_nodes: Vec<String>,
+    pub constraint_fallback_warning: bool,
 }
 
 /// Generates the Phase 2 remote ComfyUI setup & Drive persistence bash script.
@@ -72,16 +76,24 @@ else
 fi
 
 # Freeze Colab preinstalled core packages to prevent custom nodes from downgrading CUDA torch/numpy
-python3 - <<'PY' > /tmp/colab_constraints.txt
+python3 - <<'PY'
 import importlib.metadata as meta
 
-pkgs = ("torch", "torchvision", "torchaudio", "numpy", "transformers", "pillow", "safetensors")
-for p in pkgs:
-    try:
-        v = meta.version(p)
-        print(f"{{p}}=={{v}}")
-    except meta.PackageNotFoundError:
-        pass
+full_pkgs = ("torch", "torchvision", "torchaudio", "numpy", "transformers", "pillow", "safetensors")
+torch_pkgs = ("torch", "torchvision", "torchaudio")
+
+with open("/tmp/colab_constraints.txt", "w", encoding="utf-8") as f_full, open(
+    "/tmp/colab_torch_constraints.txt", "w", encoding="utf-8"
+) as f_torch:
+    for p in full_pkgs:
+        try:
+            v = meta.version(p)
+            line = f"{{p}}=={{v}}\n"
+            f_full.write(line)
+            if p in torch_pkgs:
+                f_torch.write(line)
+        except meta.PackageNotFoundError:
+            pass
 PY
 
 pip_install_req() {{
@@ -95,15 +107,29 @@ pip_install_req() {{
     rm -f "${{filtered}}"
     return 0
   fi
+  local rc=0
   if command -v uv >/dev/null 2>&1; then
-    uv pip install --system -q -c /tmp/colab_constraints.txt -r "${{filtered}}"
+    uv pip install --system -q -c /tmp/colab_constraints.txt -r "${{filtered}}" || rc=$?
+    if [ "${{rc}}" -ne 0 ]; then
+      echo "{CONSTRAINT_FALLBACK_SENTINEL}"
+      uv pip install --system -q -c /tmp/colab_torch_constraints.txt -r "${{filtered}}"
+    fi
   else
-    python3 -m pip install -q -c /tmp/colab_constraints.txt -r "${{filtered}}"
+    python3 -m pip install -q -c /tmp/colab_constraints.txt -r "${{filtered}}" || rc=$?
+    if [ "${{rc}}" -ne 0 ]; then
+      echo "{CONSTRAINT_FALLBACK_SENTINEL}"
+      python3 -m pip install -q -c /tmp/colab_torch_constraints.txt -r "${{filtered}}"
+    fi
   fi
   rm -f "${{filtered}}"
 }}
 
 layout_changed=0
+nodes_changed=0
+if [ -f /tmp/comfy_pending_restart ]; then
+  layout_changed=1
+  rm -f /tmp/comfy_pending_restart
+fi
 
 link_dir_to_drive() {{
   local local_dir="$1"
@@ -121,9 +147,18 @@ link_dir_to_drive() {{
     layout_changed=1
   elif [ -d "${{local_dir}}" ]; then
     python3 - "${{local_dir}}" "${{drive_dir}}" <<'PY'
-import os, shutil, sys
+import hashlib, os, shutil, sys, time
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 src_root, dst_root = sys.argv[1], sys.argv[2]
+ts = int(time.time())
+expected = []
 src_count = 0
 src_bytes = 0
 for dirpath, _, filenames in os.walk(src_root):
@@ -135,21 +170,34 @@ for dirpath, _, filenames in os.walk(src_root):
         dst_file = os.path.join(dst_dir, name)
         src_count += 1
         src_bytes += os.path.getsize(src_file)
+        src_hash = file_sha256(src_file)
         if not os.path.exists(dst_file):
             shutil.copy2(src_file, dst_file)
+            expected.append((dst_file, src_hash))
+        else:
+            dst_hash = file_sha256(dst_file)
+            if dst_hash == src_hash:
+                expected.append((dst_file, src_hash))
+            else:
+                stem, ext = os.path.splitext(name)
+                conflict_file = os.path.join(dst_dir, f"{{stem}}.local-{{ts}}{{ext}}")
+                idx = 1
+                while os.path.exists(conflict_file):
+                    conflict_file = os.path.join(dst_dir, f"{{stem}}.local-{{ts}}-{{idx}}{{ext}}")
+                    idx += 1
+                shutil.copy2(src_file, conflict_file)
+                expected.append((conflict_file, src_hash))
 
-# Verify every source file exists on destination with matching size before removing source
+# Verify every source file exists on destination with matching hash & size before removing source
 verified_count = 0
 verified_bytes = 0
-for dirpath, _, filenames in os.walk(src_root):
-    rel = os.path.relpath(dirpath, src_root)
-    dst_dir = dst_root if rel == "." else os.path.join(dst_root, rel)
-    for name in filenames:
-        dst_file = os.path.join(dst_dir, name)
-        if not os.path.isfile(dst_file):
-            raise SystemExit(f"Drive copy verification failed: missing {{dst_file}}")
-        verified_count += 1
-        verified_bytes += os.path.getsize(dst_file)
+for target_file, expected_hash in expected:
+    if not os.path.isfile(target_file):
+        raise SystemExit(f"Drive copy verification failed: missing {{target_file}}")
+    if file_sha256(target_file) != expected_hash:
+        raise SystemExit(f"Drive copy verification hash mismatch: {{target_file}}")
+    verified_count += 1
+    verified_bytes += os.path.getsize(target_file)
 
 if verified_count != src_count or verified_bytes < src_bytes:
     raise SystemExit(f"Drive copy verification mismatch: count={{verified_count}}/{{src_count}} bytes={{verified_bytes}}/{{src_bytes}}")
@@ -181,6 +229,7 @@ if [ "${{DRIVE_MOUNTED}}" = true ]; then
   link_dir_to_drive "${{COMFY_DIR}}/input" "${{DRIVE_ROOT}}/input"
 
   cat > /tmp/extra_model_paths.yaml.new <<YAML
+# managed-by: colab-comfyui
 colab_drive:
   base_path: ${{DRIVE_ROOT}}/models
   checkpoints: checkpoints/
@@ -201,6 +250,7 @@ YAML
 
   if [ -s "${{DRIVE_ROOT}}/custom_nodes_repos.txt" ]; then
     echo "=== [bootstrap] Restoring custom nodes from Drive ==="
+    failed_nodes=()
     while IFS= read -r line || [ -n "${{line}}" ]; do
       line="$(echo "${{line}}" | xargs)"
       [ -z "${{line}}" ] && continue
@@ -209,18 +259,40 @@ YAML
       [ -z "${{repo_url}}" ] && continue
       repo_name="$(basename "${{repo_url}}" .git)"
       node_dir="${{COMFY_DIR}}/custom_nodes/${{repo_name}}"
+      node_ok=true
       if [ ! -d "${{node_dir}}/.git" ]; then
         echo "[custom_nodes] Cloning ${{repo_name}} (${{repo_url}})"
-        git clone --depth 1 "${{repo_url}}" "${{node_dir}}"
-        if [ -n "${{commit_sha:-}}" ]; then
-          git -C "${{node_dir}}" fetch --depth 1 origin "${{commit_sha}}" >/dev/null 2>&1 || true
-          git -C "${{node_dir}}" checkout "${{commit_sha}}" >/dev/null 2>&1 || true
+        if git clone --depth 1 "${{repo_url}}" "${{node_dir}}"; then
+          nodes_changed=1
+        else
+          node_ok=false
         fi
       fi
-      if [ -f "${{node_dir}}/requirements.txt" ]; then
-        pip_install_req "${{node_dir}}/requirements.txt"
+      if [ "${{node_ok}}" = true ] && [ -n "${{commit_sha:-}}" ] && [ -d "${{node_dir}}/.git" ]; then
+        current_sha="$(git -C "${{node_dir}}" rev-parse HEAD 2>/dev/null || true)"
+        if [ "${{current_sha}}" != "${{commit_sha}}" ]; then
+          if git -C "${{node_dir}}" fetch --depth 1 origin "${{commit_sha}}" >/dev/null 2>&1 && git -C "${{node_dir}}" checkout "${{commit_sha}}" >/dev/null 2>&1; then
+            nodes_changed=1
+          else
+            echo "[custom_nodes] Warning: failed to checkout ${{commit_sha}} for ${{repo_name}}" >&2
+            node_ok=false
+          fi
+        fi
+      fi
+      if [ "${{node_ok}}" = true ] && [ -f "${{node_dir}}/requirements.txt" ]; then
+        if ! pip_install_req "${{node_dir}}/requirements.txt"; then
+          echo "[custom_nodes] Warning: pip install failed for ${{repo_name}}" >&2
+          node_ok=false
+        fi
+      fi
+      if [ "${{node_ok}}" != true ]; then
+        failed_nodes+=("${{repo_name}}")
       fi
     done < "${{DRIVE_ROOT}}/custom_nodes_repos.txt"
+    if [ "${{#failed_nodes[@]}}" -gt 0 ]; then
+      failed_csv="$(IFS=,; echo "${{failed_nodes[*]}}")"
+      echo "{CUSTOM_NODES_FAILED_PREFIX}${{failed_csv}}"
+    fi
   fi
 else
   echo "=== [bootstrap] --no-drive mode: cleaning Drive symlinks & extra_model_paths.yaml ==="
@@ -233,17 +305,19 @@ else
       mkdir -p "${{d}}"
     fi
   done
-  if [ -f "${{COMFY_DIR}}/extra_model_paths.yaml" ]; then
+  if [ -f "${{COMFY_DIR}}/extra_model_paths.yaml" ] && grep -qF '# managed-by: colab-comfyui' "${{COMFY_DIR}}/extra_model_paths.yaml"; then
     rm -f "${{COMFY_DIR}}/extra_model_paths.yaml"
     layout_changed=1
   fi
 fi
 
+restart_needed=$(( layout_changed || nodes_changed ))
+
 need_start=true
 takeover_state="NONE"
 if curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
   echo "=== [bootstrap] Existing ComfyUI detected; auditing launch flags ==="
-  takeover_state="$(python3 - "${{COMFY_PORT}}" "${{layout_changed}}" <<'PY'
+  takeover_state="$(python3 - "${{COMFY_PORT}}" "${{restart_needed}}" <<'PY'
 import glob, json, os, sys, urllib.request
 
 port = int(sys.argv[1])
@@ -315,6 +389,7 @@ PY
     echo "{CORS_HEADER_BUSY_SENTINEL}"
     need_start=false
   elif [ "${{takeover_state}}" = "LAYOUT_BUSY" ]; then
+    touch /tmp/comfy_pending_restart
     echo "{LAYOUT_CHANGED_BUSY_SENTINEL}"
     need_start=false
   elif [ "${{takeover_state}}" = "NEEDS_RESTART" ]; then
@@ -332,7 +407,7 @@ if [ "${{need_start}}" = true ]; then
 
   launch_new=true
   if [ "${{takeover_state}}" = "NEEDS_RESTART" ] && curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
-    recheck_state="$(python3 - "${{COMFY_PORT}}" "${{layout_changed}}" <<'PY'
+    recheck_state="$(python3 - "${{COMFY_PORT}}" "${{restart_needed}}" <<'PY'
 import glob, json, os, signal, sys, urllib.request
 
 port = int(sys.argv[1])
@@ -410,6 +485,7 @@ PY
       echo "{CORS_HEADER_BUSY_SENTINEL}"
       launch_new=false
     elif [ "${{recheck_state}}" = "BECAME_BUSY_LAYOUT" ]; then
+      touch /tmp/comfy_pending_restart
       echo "{LAYOUT_CHANGED_BUSY_SENTINEL}"
       launch_new=false
     elif [ "${{recheck_state}}" = "STOP_SENT" ]; then
@@ -461,6 +537,8 @@ pub fn parse_bootstrap_output(out: &CommandOutput) -> Result<BootstrapOutcome, C
     let mut ready = false;
     let mut cors_header_busy_warning = false;
     let mut layout_changed_busy_warning = false;
+    let mut failed_custom_nodes = Vec::new();
+    let mut constraint_fallback_warning = false;
     for line in out.stdout_raw.lines() {
         let trimmed = line.trim();
         if trimmed == COMFY_READY_SENTINEL {
@@ -469,6 +547,14 @@ pub fn parse_bootstrap_output(out: &CommandOutput) -> Result<BootstrapOutcome, C
             cors_header_busy_warning = true;
         } else if trimmed == LAYOUT_CHANGED_BUSY_SENTINEL {
             layout_changed_busy_warning = true;
+        } else if trimmed == CONSTRAINT_FALLBACK_SENTINEL {
+            constraint_fallback_warning = true;
+        } else if let Some(csv) = trimmed.strip_prefix(CUSTOM_NODES_FAILED_PREFIX) {
+            for item in csv.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !failed_custom_nodes.iter().any(|existing| existing == item) {
+                    failed_custom_nodes.push(item.to_string());
+                }
+            }
         }
     }
     if !ready {
@@ -483,6 +569,8 @@ pub fn parse_bootstrap_output(out: &CommandOutput) -> Result<BootstrapOutcome, C
     Ok(BootstrapOutcome {
         cors_header_busy_warning,
         layout_changed_busy_warning,
+        failed_custom_nodes,
+        constraint_fallback_warning,
     })
 }
 
@@ -561,10 +649,16 @@ mod tests {
     fn bootstrap_script_cleans_dangling_symlinks_and_yaml_in_no_drive_mode() {
         let script = build_remote_setup_script(8188, false);
         assert!(script.contains("USE_DRIVE=\"false\""));
-        assert!(script.contains("extra_model_paths.yaml"));
+        assert!(script.contains("# managed-by: colab-comfyui"));
+        assert!(script.contains("grep -qF '# managed-by: colab-comfyui'"));
         assert!(script.contains("if [ -L \"${d}\" ]; then"));
         assert!(script.contains("verified_count != src_count or verified_bytes < src_bytes"));
+        assert!(script.contains("file_sha256"));
+        assert!(script.contains(".local-{ts}"));
         assert!(script.contains("git -C \"${node_dir}\" checkout \"${commit_sha}\""));
+        assert!(script.contains("/tmp/colab_torch_constraints.txt"));
+        assert!(script.contains("/tmp/comfy_pending_restart"));
+        assert!(script.contains(CUSTOM_NODES_FAILED_PREFIX));
     }
 
     #[test]
@@ -579,12 +673,16 @@ mod tests {
             BootstrapOutcome {
                 cors_header_busy_warning: false,
                 layout_changed_busy_warning: false,
+                failed_custom_nodes: vec![],
+                constraint_fallback_warning: false,
             }
         );
 
         let busy = CommandOutput::from_raw(
             Some(0),
-            format!("{CORS_HEADER_BUSY_SENTINEL}\n{COMFY_READY_SENTINEL}\n"),
+            format!(
+                "{CORS_HEADER_BUSY_SENTINEL}\n{CONSTRAINT_FALLBACK_SENTINEL}\n{CUSTOM_NODES_FAILED_PREFIX}node-a,node-b\n{COMFY_READY_SENTINEL}\n"
+            ),
             String::new(),
         );
         assert_eq!(
@@ -592,6 +690,8 @@ mod tests {
             BootstrapOutcome {
                 cors_header_busy_warning: true,
                 layout_changed_busy_warning: false,
+                failed_custom_nodes: vec!["node-a".to_string(), "node-b".to_string()],
+                constraint_fallback_warning: true,
             }
         );
 

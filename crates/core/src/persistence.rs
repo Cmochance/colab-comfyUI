@@ -14,7 +14,8 @@ use crate::CoreError;
 
 pub const MAX_DRIVE_MOUNT_ATTEMPTS: u8 = 2;
 pub const DRIVE_AUTH_TIMEOUT: Duration = Duration::from_secs(600);
-pub const DRIVE_EXPORT_TIMEOUT: Duration = Duration::from_secs(90);
+pub const DRIVE_FAILED_GRACE_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_DRIVE_EXPORT_TIMEOUT_SECS: u64 = 90;
 const DRIVE_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub struct DriveAuthPrompt {
     pub auth_url: Option<String>,
     pub started_at_unix: u64,
     pub deadline_unix: u64,
+    pub grace_deadline_unix: Option<u64>,
     pub attempt: u8,
     pub max_attempts: u8,
     pub status: DriveAuthStatus,
@@ -39,6 +41,7 @@ pub struct DriveAuthPrompt {
 pub struct DriveExportReport {
     pub ok: bool,
     pub flush_ok: bool,
+    pub unmounted: bool,
     pub workflow_updated: bool,
     pub user_files: usize,
     pub output_files: usize,
@@ -47,9 +50,25 @@ pub struct DriveExportReport {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountProbe {
+    MountedHealthy,
+    MountedUnhealthy,
+    NotMounted,
+}
+
+/// Line emitted by `colab drivemount`, carrying both redacted log text and
+/// any unredacted authorization URL extracted prior to log redaction (P1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrivemountLine {
+    pub redacted: String,
+    pub auth_url: Option<String>,
+    pub is_auth_prompt: bool,
+}
+
 /// Interactive child process handle for `colab drivemount` (detached via `setsid()`).
 pub trait DrivemountProcess: Send {
-    fn next_line<'a>(&'a mut self) -> BoxFuture<'a, Option<String>>;
+    fn next_line<'a>(&'a mut self) -> BoxFuture<'a, Option<DrivemountLine>>;
     fn send_newline<'a>(&'a mut self) -> BoxFuture<'a, Result<(), CoreError>>;
     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<i32>, CoreError>>;
     fn kill<'a>(&'a mut self) -> BoxFuture<'a, Result<(), CoreError>>;
@@ -67,11 +86,11 @@ pub trait DrivemountSpawner: Send + Sync {
 pub struct TokioDrivemountProcess {
     child: Child,
     stdin: Option<ChildStdin>,
-    lines_rx: mpsc::UnboundedReceiver<String>,
+    lines_rx: mpsc::UnboundedReceiver<DrivemountLine>,
 }
 
 impl DrivemountProcess for TokioDrivemountProcess {
-    fn next_line<'a>(&'a mut self) -> BoxFuture<'a, Option<String>> {
+    fn next_line<'a>(&'a mut self) -> BoxFuture<'a, Option<DrivemountLine>> {
         Box::pin(async move { self.lines_rx.recv().await })
     }
 
@@ -150,22 +169,28 @@ impl DrivemountSpawner for TokioDrivemountSpawner {
         let stderr = child.stderr.take();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        if let Some(out) = stdout {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(out).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = tx.send(redact_sensitive_text(&line));
+        for stream_opt in [stdout.map(Left), stderr.map(Right)] {
+            match stream_opt {
+                Some(Left(out)) => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let mut lines = BufReader::new(out).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let _ = tx.send(parse_drivemount_line(&line));
+                        }
+                    });
                 }
-            });
-        }
-        if let Some(err) = stderr {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(err).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = tx.send(redact_sensitive_text(&line));
+                Some(Right(err)) => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let mut lines = BufReader::new(err).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let _ = tx.send(parse_drivemount_line(&line));
+                        }
+                    });
                 }
-            });
+                None => {}
+            }
         }
 
         Ok(Box::new(TokioDrivemountProcess {
@@ -173,6 +198,20 @@ impl DrivemountSpawner for TokioDrivemountSpawner {
             stdin,
             lines_rx: rx,
         }))
+    }
+}
+
+enum EitherStream<A, B> {
+    Left(A),
+    Right(B),
+}
+use EitherStream::{Left, Right};
+
+pub fn parse_drivemount_line(raw_line: &str) -> DrivemountLine {
+    DrivemountLine {
+        auth_url: extract_drive_auth_url(raw_line),
+        is_auth_prompt: is_drive_auth_prompt_line(raw_line),
+        redacted: redact_sensitive_text(raw_line),
     }
 }
 
@@ -186,17 +225,30 @@ pub fn drivemount_args(session_name: &str) -> Result<Vec<String>, CoreError> {
 }
 
 /// Checks whether `/content/drive/MyDrive` is mounted over the active `ControlMaster` socket.
+/// Never runs `shutil.rmtree` if `/content/drive` is present in `/proc/mounts` (H1);
+/// when unmounted, only removes an empty `/content/drive` or renames a non-empty stale dir.
 pub async fn check_drive_mounted_mux(
     ctl_sock: &Path,
     runner: &dyn CommandRunner,
-) -> Result<bool, CoreError> {
+) -> Result<MountProbe, CoreError> {
     let script = concat!(
         "python3 - <<'PY'\n",
-        "import os, shutil\n",
-        "mounted = os.path.isdir('/content/drive/MyDrive') and any(' /content/drive' in l for l in open('/proc/mounts'))\n",
-        "if not mounted and os.path.exists('/content/drive'):\n",
-        "    shutil.rmtree('/content/drive', ignore_errors=True)\n",
-        "print('DRIVE_MOUNTED=' + ('1' if mounted else '0'))\n",
+        "import os, time\n",
+        "in_mounts = any(' /content/drive ' in l or ' /content/drive\\t' in l for l in open('/proc/mounts'))\n",
+        "if in_mounts:\n",
+        "    if os.path.isdir('/content/drive/MyDrive'):\n",
+        "        print('DRIVE_PROBE=MOUNTED_HEALTHY')\n",
+        "    else:\n",
+        "        print('DRIVE_PROBE=MOUNTED_UNHEALTHY')\n",
+        "else:\n",
+        "    if os.path.exists('/content/drive'):\n",
+        "        try:\n",
+        "            os.rmdir('/content/drive')\n",
+        "        except OSError:\n",
+        "            stale = f'/content/drive.stale.{int(time.time())}'\n",
+        "            os.rename('/content/drive', stale)\n",
+        "            print(f'STALE_DRIVE_MOVED={stale}')\n",
+        "    print('DRIVE_PROBE=NOT_MOUNTED')\n",
         "PY\n"
     );
     let spec = build_mux_exec_spec(
@@ -206,10 +258,20 @@ pub async fn check_drive_mounted_mux(
         DRIVE_CHECK_TIMEOUT,
     );
     let out = runner.run(spec, None).await?;
-    Ok(out
-        .stdout_raw
-        .lines()
-        .any(|l| l.trim() == "DRIVE_MOUNTED=1"))
+    Ok(parse_mount_probe(&out.stdout_raw))
+}
+
+pub fn parse_mount_probe(stdout: &str) -> MountProbe {
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t == "DRIVE_PROBE=MOUNTED_HEALTHY" || t == "DRIVE_MOUNTED=1" {
+            return MountProbe::MountedHealthy;
+        }
+        if t == "DRIVE_PROBE=MOUNTED_UNHEALTHY" {
+            return MountProbe::MountedUnhealthy;
+        }
+    }
+    MountProbe::NotMounted
 }
 
 pub fn extract_drive_auth_url(line: &str) -> Option<String> {
@@ -265,8 +327,9 @@ pub fn extract_latest_workflow_from_history(json_str: &str) -> Option<(i64, serd
     best
 }
 
-pub fn build_remote_export_script(include_outputs: bool) -> String {
+pub fn build_remote_export_script(include_outputs: bool, unmount: bool) -> String {
     let export_outputs_py = if include_outputs { "True" } else { "False" };
+    let unmount_py = if unmount { "True" } else { "False" };
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -276,9 +339,11 @@ import json
 import os
 import shutil
 import subprocess
+import urllib.parse
 import urllib.request
 
 EXPORT_OUTPUTS = {export_outputs_py}
+UNMOUNT_DRIVE = {unmount_py}
 COMFY_DIR = "/content/ComfyUI"
 DRIVE_ROOT = "/content/drive/MyDrive/ComfyUI"
 USER_DEFAULT_DIR = os.path.join(COMFY_DIR, "user", "default")
@@ -350,6 +415,18 @@ def copy_tree(src_root, dst_root, skip_names=None):
             copied += 1
     return copied
 
+def strip_url_credentials(raw_url):
+    try:
+        parsed = urllib.parse.urlsplit(raw_url)
+        if parsed.username is not None or parsed.password is not None:
+            host = parsed.hostname or ""
+            if parsed.port is not None:
+                host = f"{{host}}:{{parsed.port}}"
+            return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        pass
+    return raw_url
+
 user_count = copy_tree(USER_DEFAULT_DIR, os.path.join(DRIVE_ROOT, "user_default"))
 output_count = 0
 if EXPORT_OUTPUTS:
@@ -373,7 +450,7 @@ if os.path.isdir(custom_nodes_dir):
             url_res = subprocess.run(["git", "-C", node_path, "remote", "get-url", "origin"], capture_output=True, text=True)
             sha_res = subprocess.run(["git", "-C", node_path, "rev-parse", "HEAD"], capture_output=True, text=True)
             if url_res.returncode == 0 and url_res.stdout.strip():
-                url = url_res.stdout.strip()
+                url = strip_url_credentials(url_res.stdout.strip())
                 sha = sha_res.stdout.strip() if sha_res.returncode == 0 else ""
                 repos.append(f"{{url}} {{sha}}".strip())
 
@@ -383,12 +460,21 @@ with open(repos_file, "w", encoding="utf-8") as f:
         f.write(r + "\n")
 
 flush_ok = False
-try:
-    from google.colab import drive
-    drive.flush_and_unmount()
-    flush_ok = True
-except Exception as exc:
-    print(f"[export] Warning: flush_and_unmount failed: {{exc}}")
+unmounted = False
+if UNMOUNT_DRIVE:
+    try:
+        from google.colab import drive
+        drive.flush_and_unmount()
+        flush_ok = True
+        unmounted = True
+    except Exception as exc:
+        print(f"[export] Warning: flush_and_unmount failed: {{exc}}")
+else:
+    try:
+        os.sync()
+        flush_ok = True
+    except Exception as exc:
+        print(f"[export] Warning: os.sync failed: {{exc}}")
 
 print(f"EXPORT_WORKFLOW_UPDATED={{1 if workflow_updated else 0}}")
 print(f"EXPORT_USER_FILES={{user_count}}")
@@ -396,6 +482,7 @@ print(f"EXPORT_OUTPUT_FILES={{output_count}}")
 print(f"EXPORT_INPUT_FILES={{input_count}}")
 print(f"EXPORT_CUSTOM_NODES={{len(repos)}}")
 print(f"FLUSH_OK={{1 if flush_ok else 0}}")
+print(f"EXPORT_UNMOUNTED={{1 if unmounted else 0}}")
 print("EXPORT_OK=1")
 PY
 "#
@@ -406,6 +493,7 @@ pub fn parse_export_output(stdout: &str) -> DriveExportReport {
     let mut report = DriveExportReport {
         ok: false,
         flush_ok: false,
+        unmounted: false,
         workflow_updated: false,
         user_files: 0,
         output_files: 0,
@@ -419,6 +507,8 @@ pub fn parse_export_output(stdout: &str) -> DriveExportReport {
             report.ok = true;
         } else if t == "FLUSH_OK=1" {
             report.flush_ok = true;
+        } else if t == "EXPORT_UNMOUNTED=1" {
+            report.unmounted = true;
         } else if t == "EXPORT_WORKFLOW_UPDATED=1" {
             report.workflow_updated = true;
         } else if let Some(v) = t.strip_prefix("EXPORT_USER_FILES=") {
@@ -433,16 +523,16 @@ pub fn parse_export_output(stdout: &str) -> DriveExportReport {
     }
     report.summary = if report.ok && report.flush_ok {
         format!(
-            "已导出到 Drive 并完成刷盘（工作流更新={}，nodes={}，user={}，output={}，input={}）。",
+            "已导出到 Drive 并完成刷盘（工作流更新={}，nodes={}，user={}，output={}，input={}，卸载={}）。",
             report.workflow_updated,
             report.custom_nodes_count,
             report.user_files,
             report.output_files,
-            report.input_files
+            report.input_files,
+            report.unmounted
         )
     } else if report.ok {
-        "已写入 Drive 目录，但 drive.flush_and_unmount() 未确认完成（Drive 同步未确认）。"
-            .to_string()
+        "已写入 Drive 目录，但刷盘未确认完成（Drive 同步未确认）。".to_string()
     } else {
         "Drive 导出未完成（Drive 同步未确认）。".to_string()
     };
@@ -452,14 +542,16 @@ pub fn parse_export_output(stdout: &str) -> DriveExportReport {
 pub async fn run_remote_export_and_flush(
     ctl_sock: &Path,
     include_outputs: bool,
+    unmount: bool,
+    timeout: Duration,
     runner: &dyn CommandRunner,
 ) -> Result<DriveExportReport, CoreError> {
-    let script = build_remote_export_script(include_outputs);
+    let script = build_remote_export_script(include_outputs, unmount);
     let spec = build_mux_exec_spec(
         ctl_sock,
         "bash -s",
         StdinPolicy::Bytes(script.into_bytes()),
-        DRIVE_EXPORT_TIMEOUT,
+        timeout,
     );
     let out = runner.run(spec, None).await?;
     Ok(parse_export_output(&out.stdout_raw))
@@ -488,20 +580,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_drive_auth_url_and_prompt_lines() {
+    fn parses_drive_auth_url_and_prompt_lines_before_redaction() {
         let line = "REQUIRED: Google Drive Authorization needed. Visit https://accounts.google.com/o/oauth2/auth?client_id=123 and press Enter.";
-        assert!(is_drive_auth_prompt_line(line));
+        let parsed = parse_drivemount_line(line);
+        assert!(parsed.is_auth_prompt);
         assert_eq!(
-            extract_drive_auth_url(line).as_deref(),
+            parsed.auth_url.as_deref(),
             Some("https://accounts.google.com/o/oauth2/auth?client_id=123")
         );
     }
 
     #[test]
+    fn parses_mount_probe_three_states() {
+        assert_eq!(
+            parse_mount_probe("DRIVE_PROBE=MOUNTED_HEALTHY\n"),
+            MountProbe::MountedHealthy
+        );
+        assert_eq!(
+            parse_mount_probe("DRIVE_PROBE=MOUNTED_UNHEALTHY\n"),
+            MountProbe::MountedUnhealthy
+        );
+        assert_eq!(
+            parse_mount_probe("DRIVE_PROBE=NOT_MOUNTED\n"),
+            MountProbe::NotMounted
+        );
+    }
+
+    #[test]
     fn parses_export_and_flush_sentinels() {
-        let ok_out = "EXPORT_WORKFLOW_UPDATED=1\nEXPORT_USER_FILES=3\nEXPORT_OUTPUT_FILES=2\nEXPORT_INPUT_FILES=1\nEXPORT_CUSTOM_NODES=4\nFLUSH_OK=1\nEXPORT_OK=1\n";
+        let ok_out = "EXPORT_WORKFLOW_UPDATED=1\nEXPORT_USER_FILES=3\nEXPORT_OUTPUT_FILES=2\nEXPORT_INPUT_FILES=1\nEXPORT_CUSTOM_NODES=4\nFLUSH_OK=1\nEXPORT_UNMOUNTED=1\nEXPORT_OK=1\n";
         let r1 = parse_export_output(ok_out);
-        assert!(r1.ok && r1.flush_ok && r1.workflow_updated);
+        assert!(r1.ok && r1.flush_ok && r1.unmounted && r1.workflow_updated);
         assert_eq!(r1.custom_nodes_count, 4);
 
         let no_flush = "EXPORT_CUSTOM_NODES=2\nFLUSH_OK=0\nEXPORT_OK=1\n";
@@ -511,10 +620,15 @@ mod tests {
     }
 
     #[test]
-    fn export_script_pins_commit_sha_and_calls_flush_and_unmount() {
-        let s = build_remote_export_script(false);
-        assert!(s.contains("EXPORT_OUTPUTS = False"));
-        assert!(s.contains("git\", \"-C\", node_path, \"rev-parse\", \"HEAD\""));
-        assert!(s.contains("drive.flush_and_unmount()"));
+    fn manual_export_script_keeps_drive_mounted_and_strips_git_credentials() {
+        let s_manual = build_remote_export_script(false, false);
+        assert!(s_manual.contains("EXPORT_OUTPUTS = False"));
+        assert!(s_manual.contains("UNMOUNT_DRIVE = False"));
+        assert!(s_manual.contains("strip_url_credentials"));
+        assert!(s_manual.contains("os.sync()"));
+
+        let s_stop = build_remote_export_script(true, true);
+        assert!(s_stop.contains("UNMOUNT_DRIVE = True"));
+        assert!(s_stop.contains("drive.flush_and_unmount()"));
     }
 }
