@@ -1,13 +1,16 @@
 pub mod agy_bridge;
 pub mod bootstrap;
+pub mod catalog;
 pub mod colab_cli;
 pub mod config;
+pub mod hf_keychain;
 pub mod i18n;
 pub mod local_proxy;
 pub mod locate;
 pub mod persistence;
 pub mod runner;
 pub mod ssh_tunnel;
+pub mod sync;
 pub mod telemetry;
 pub mod watchdog;
 pub mod webview_policy;
@@ -33,13 +36,19 @@ use crate::agy_bridge::{
     refresh_agy_colab_quota, switch_agy_colab_account, AgyColabAccount,
 };
 use crate::bootstrap::{run_remote_bootstrap, BootstrapOutcome};
+use crate::catalog::{
+    builtin_catalog, check_disk_quota, parse_aria2c_progress_line, resolve_custom_hf_file,
+    run_remote_model_download, upload_workflow_to_remote, CatalogModelFile, CatalogPreset,
+    DownloadProgress, DownloadTargetStorage,
+};
 use crate::colab_cli::{SessionEntry, SessionStatusLookup, StopReport, UsageInfo};
 use crate::config::{
     active_session_path, append_app_log_0600, config_path, ctl_socket_path,
     default_session_name_for_email, ensure_data_dirs, load_json_opt, pending_session_path,
-    remove_if_exists, save_json_0600, validate_session_name, ActiveSession, AppConfig, GpuTier,
-    PendingSession, StateLock, LOCAL_PROXY_PORT, REMOTE_COMFY_PORT,
+    remove_if_exists, save_json_0600, sync_cursor_path, validate_session_name, ActiveSession,
+    AppConfig, GpuTier, PendingSession, StateLock, SyncCursor, LOCAL_PROXY_PORT, REMOTE_COMFY_PORT,
 };
+use crate::hf_keychain::{delete_hf_token, get_hf_token, has_hf_token, set_hf_token};
 use crate::i18n::{message_table, Locale};
 use crate::local_proxy::{start_local_proxy, LocalProxyHandle};
 use crate::locate::{check_env, resolve_proxy_envs, EnvReport};
@@ -55,6 +64,11 @@ use crate::runner::{
 use crate::ssh_tunnel::{
     build_mux_exec_spec, start_master_and_verify, stop_master_tunnel, TokioTunnelSpawner,
     TunnelProcess, TunnelSpawner,
+};
+use crate::sync::{
+    default_images_dir, default_videos_dir, download_output_to_local_dir, extract_history_outputs,
+    fetch_local_comfy_json_long, list_gallery_items, read_ws_executed_once, reveal_in_finder,
+    GalleryItem,
 };
 use crate::telemetry::{
     estimated_remaining_minutes, fetch_local_comfy_json, fetch_remote_probe, parse_comfy_queue,
@@ -276,6 +290,11 @@ pub struct AppSnapshot {
     pub telemetry: TelemetrySnapshot,
     pub watchdog: WatchdogSnapshot,
     pub last_export_report: Option<DriveExportReport>,
+    pub hf_token_configured: bool,
+    pub catalog_presets: Vec<CatalogPreset>,
+    pub download_progress: Option<DownloadProgress>,
+    pub synced_count: usize,
+    pub gallery_items: Vec<GalleryItem>,
     pub logs: Vec<String>,
     pub i18n: BTreeMap<String, String>,
 }
@@ -295,6 +314,7 @@ struct RuntimeHandles {
     comfy_sock: Option<PathBuf>,
     supervisor_task: Option<JoinHandle<()>>,
     telemetry_task: Option<JoinHandle<()>>,
+    sync_task: Option<JoinHandle<()>>,
 }
 
 struct InnerState {
@@ -321,6 +341,11 @@ struct InnerState {
     telemetry: TelemetrySnapshot,
     watchdog: WatchdogSnapshot,
     last_export_report: Option<DriveExportReport>,
+    hf_token_configured: bool,
+    catalog_presets: Vec<CatalogPreset>,
+    download_progress: Option<DownloadProgress>,
+    synced_count: usize,
+    gallery_items: Vec<GalleryItem>,
     has_managed_session: Arc<AtomicBool>,
 }
 
@@ -462,6 +487,8 @@ pub struct SessionManager {
     watchdog_stop_notify: Arc<Notify>,
     account_switch_in_flight: Arc<AtomicBool>,
     low_balance_notified: Arc<AtomicBool>,
+    download_in_flight: Arc<AtomicBool>,
+    sync_mutex: Arc<Mutex<()>>,
 }
 
 impl SessionManager {
@@ -545,8 +572,30 @@ impl SessionManager {
             telemetry: TelemetrySnapshot::default(),
             watchdog: wd_snap,
             last_export_report: None,
+            hf_token_configured: false,
+            catalog_presets: builtin_catalog(),
+            download_progress: None,
+            synced_count: 0,
+            gallery_items: Vec::new(),
             has_managed_session: has_managed_session.clone(),
         };
+        let initial_gallery = {
+            let img = inner
+                .config
+                .sync_images_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_images_dir(home_dir.as_deref()));
+            let vid = inner
+                .config
+                .sync_videos_dir
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_videos_dir(home_dir.as_deref()));
+            list_gallery_items(&img, &vid)
+        };
+        let mut inner = inner;
+        inner.gallery_items = initial_gallery;
 
         Self {
             data_dir,
@@ -575,6 +624,8 @@ impl SessionManager {
             watchdog_stop_notify: Arc::new(Notify::new()),
             account_switch_in_flight: Arc::new(AtomicBool::new(false)),
             low_balance_notified: Arc::new(AtomicBool::new(false)),
+            download_in_flight: Arc::new(AtomicBool::new(false)),
+            sync_mutex: Arc::new(Mutex::new(())),
         }
     }
 
@@ -693,6 +744,11 @@ impl SessionManager {
             telemetry: s.telemetry.clone(),
             watchdog: s.watchdog.clone(),
             last_export_report: s.last_export_report.clone(),
+            hf_token_configured: s.hf_token_configured,
+            catalog_presets: s.catalog_presets.clone(),
+            download_progress: s.download_progress.clone(),
+            synced_count: s.synced_count,
+            gallery_items: s.gallery_items.clone(),
             logs,
             i18n: table,
         }
@@ -821,7 +877,9 @@ impl SessionManager {
         let queue_idle = match override_queue_idle {
             Some(v) => v,
             None => {
-                if self.local_proxy_port != 0 {
+                if self.download_in_flight.load(Ordering::SeqCst) {
+                    Some(false)
+                } else if self.local_proxy_port != 0 {
                     match fetch_local_comfy_json(self.local_proxy_port, "/queue").await {
                         Ok(body) => parse_comfy_queue(&body).ok().map(|(r, p)| r == 0 && p == 0),
                         Err(_) => None,
@@ -1045,6 +1103,424 @@ impl SessionManager {
         Ok("guide_terminal".to_string())
     }
 
+    pub async fn set_hf_token_secret(&self, token: String) -> Result<AppSnapshot, CoreError> {
+        set_hf_token(&token, self.runner.as_ref()).await?;
+        {
+            let mut guard = self.state.lock().await;
+            guard.hf_token_configured = true;
+        }
+        self.push_log(
+            "已安全写入 HF_TOKEN 到 macOS 钥匙串（仅在下载时注入远端内存）。".to_string(),
+        )
+        .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn clear_hf_token_secret(&self) -> Result<AppSnapshot, CoreError> {
+        delete_hf_token(self.runner.as_ref()).await?;
+        {
+            let mut guard = self.state.lock().await;
+            guard.hf_token_configured = false;
+        }
+        self.push_log("已从 macOS 钥匙串清除 HF_TOKEN。".to_string())
+            .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn set_sync_preferences(
+        &self,
+        auto_sync_outputs: Option<bool>,
+        sync_images_dir: Option<String>,
+        sync_videos_dir: Option<String>,
+    ) -> Result<AppSnapshot, CoreError> {
+        {
+            let mut guard = self.state.lock().await;
+            if let Some(v) = auto_sync_outputs {
+                guard.config.auto_sync_outputs = v;
+            }
+            if let Some(d) = sync_images_dir {
+                let trimmed = d.trim().to_string();
+                guard.config.sync_images_dir = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+            }
+            if let Some(d) = sync_videos_dir {
+                let trimmed = d.trim().to_string();
+                guard.config.sync_videos_dir = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+            }
+            save_json_0600(&config_path(&self.data_dir), &guard.config)?;
+        }
+        self.refresh_gallery().await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    fn effective_sync_dirs(&self, cfg: &AppConfig) -> (PathBuf, PathBuf) {
+        let img = cfg
+            .sync_images_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_images_dir(self.home_dir.as_deref()));
+        let vid = cfg
+            .sync_videos_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_videos_dir(self.home_dir.as_deref()));
+        (img, vid)
+    }
+
+    pub async fn refresh_gallery(&self) -> AppSnapshot {
+        let (img_dir, vid_dir) = {
+            let guard = self.state.lock().await;
+            self.effective_sync_dirs(&guard.config)
+        };
+        let items = tokio::task::spawn_blocking(move || list_gallery_items(&img_dir, &vid_dir))
+            .await
+            .unwrap_or_default();
+        {
+            let mut guard = self.state.lock().await;
+            guard.gallery_items = items;
+        }
+        self.notify_snapshot();
+        self.snapshot().await
+    }
+
+    pub async fn reveal_gallery_item(&self, path: String) -> Result<(), CoreError> {
+        let (img_dir, vid_dir) = {
+            let guard = self.state.lock().await;
+            self.effective_sync_dirs(&guard.config)
+        };
+        let target = std::fs::canonicalize(Path::new(&path)).map_err(|source| CoreError::Io {
+            context: "canonicalize gallery item".to_string(),
+            source,
+        })?;
+        if !target.is_file() {
+            return Err(CoreError::InvalidInput {
+                detail: "画廊目标不是有效文件".to_string(),
+            });
+        }
+        let allowed = [img_dir, vid_dir]
+            .into_iter()
+            .filter_map(|d| std::fs::canonicalize(d).ok())
+            .any(|dir| target.starts_with(&dir));
+        if !allowed {
+            return Err(CoreError::InvalidInput {
+                detail: "仅允许在本地成品同步目录内打开文件".to_string(),
+            });
+        }
+        reveal_in_finder(&target, self.runner.as_ref()).await
+    }
+
+    pub async fn download_catalog_preset(
+        &self,
+        preset_id: String,
+        storage: DownloadTargetStorage,
+    ) -> Result<AppSnapshot, CoreError> {
+        let preset = {
+            let guard = self.state.lock().await;
+            guard
+                .catalog_presets
+                .iter()
+                .find(|p| p.id == preset_id)
+                .cloned()
+        }
+        .ok_or_else(|| CoreError::InvalidInput {
+            detail: format!("未找到模型预设：{preset_id}"),
+        })?;
+        self.download_model_files(preset.id, preset.files, storage)
+            .await
+    }
+
+    pub async fn download_custom_hf_model(
+        &self,
+        input: String,
+        subdir: String,
+        filename_override: Option<String>,
+        storage: DownloadTargetStorage,
+    ) -> Result<AppSnapshot, CoreError> {
+        let file = resolve_custom_hf_file(&input, &subdir, filename_override.as_deref())?;
+        self.download_model_files(format!("custom:{}", file.filename), vec![file], storage)
+            .await
+    }
+
+    async fn download_model_files(
+        &self,
+        preset_id: String,
+        files: Vec<CatalogModelFile>,
+        storage: DownloadTargetStorage,
+    ) -> Result<AppSnapshot, CoreError> {
+        if self
+            .download_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(CoreError::InvalidInput {
+                detail: "已有模型下载任务正在进行中，请等待完成".to_string(),
+            });
+        }
+        struct DownloadInFlightGuard(Arc<AtomicBool>);
+        impl Drop for DownloadInFlightGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _dl_guard = DownloadInFlightGuard(self.download_in_flight.clone());
+
+        let ctl_sock = {
+            let h = self.handles.lock().await;
+            h.ctl_sock.clone()
+        }
+        .ok_or_else(|| CoreError::TunnelFailed {
+            detail: "当前没有已连接的 SSH 隧道，无法下载模型".to_string(),
+        })?;
+
+        let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
+        let (mut content_free, mut drive_free) = {
+            let guard = self.state.lock().await;
+            (
+                guard.telemetry.content_free_bytes,
+                guard.telemetry.drive_free_bytes,
+            )
+        };
+        let needs_probe = match storage {
+            DownloadTargetStorage::VmContent => content_free.is_none(),
+            DownloadTargetStorage::Drive => drive_free.is_none(),
+        };
+        if needs_probe {
+            if let Ok(remote) = fetch_remote_probe(&ctl_sock, self.runner.as_ref()).await {
+                content_free = remote.content_free_bytes.or(content_free);
+                drive_free = remote.drive_free_bytes.or(drive_free);
+            }
+        }
+        check_disk_quota(total_bytes, storage, content_free, drive_free)?;
+
+        let hf_token = get_hf_token(self.runner.as_ref()).await.unwrap_or(None);
+        let total_files = files.len();
+        {
+            let mut guard = self.state.lock().await;
+            guard.download_progress = Some(DownloadProgress {
+                preset_id: preset_id.clone(),
+                current_file: files
+                    .first()
+                    .map(|f| f.filename.clone())
+                    .unwrap_or_default(),
+                file_index: 1,
+                total_files,
+                percent: 0,
+                speed: String::new(),
+                status: "downloading".to_string(),
+            });
+        }
+        self.notify_snapshot();
+
+        let state_ref = self.state.clone();
+        let snapshot_tx = self.snapshot_tx.clone();
+        let logs_ref = self.logs.clone();
+        let data_dir_ref = self.data_dir.clone();
+        let preset_clone = preset_id.clone();
+        let file_idx_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cb: LineCallback = Arc::new(move |line: String| {
+            let redacted = redact_sensitive_text(&line);
+            if let Some(fname) = redacted.strip_prefix("MODEL_FILE_START=") {
+                let idx = file_idx_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Ok(mut guard) = state_ref.try_lock() {
+                    if let Some(ref mut p) = guard.download_progress {
+                        p.file_index = idx.min(p.total_files.max(1));
+                        p.current_file = fname.trim().to_string();
+                        p.percent = 0;
+                        p.status = "downloading".to_string();
+                    }
+                }
+                bump_snapshot(&snapshot_tx);
+            } else if let Some(fname) = redacted.strip_prefix("MODEL_SKIPPED=") {
+                let idx = file_idx_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Ok(mut guard) = state_ref.try_lock() {
+                    if let Some(ref mut p) = guard.download_progress {
+                        p.file_index = idx.min(p.total_files.max(1));
+                        p.current_file = fname.trim().to_string();
+                        p.percent = 100;
+                        p.status = "skipped".to_string();
+                    }
+                }
+                bump_snapshot(&snapshot_tx);
+            } else if let Some((pct, speed)) = parse_aria2c_progress_line(&redacted) {
+                if let Ok(mut guard) = state_ref.try_lock() {
+                    if let Some(ref mut p) = guard.download_progress {
+                        p.percent = pct;
+                        p.speed = speed;
+                    }
+                }
+                bump_snapshot(&snapshot_tx);
+            } else {
+                record_watchdog_log(
+                    &logs_ref,
+                    &data_dir_ref,
+                    format!("[catalog:{preset_clone}] {redacted}"),
+                );
+            }
+        });
+
+        let res = run_remote_model_download(
+            &ctl_sock,
+            &files,
+            storage,
+            hf_token.as_deref(),
+            self.runner.as_ref(),
+            Some(cb),
+        )
+        .await;
+
+        {
+            let mut guard = self.state.lock().await;
+            guard.download_progress = None;
+        }
+        self.notify_snapshot();
+        res?;
+        self.push_log(format!("模型下载并核验完成：{preset_id}"))
+            .await;
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn send_workflow_to_canvas(
+        &self,
+        filename: String,
+        workflow_json: String,
+    ) -> Result<AppSnapshot, CoreError> {
+        let trimmed = filename.trim();
+        let base = Path::new(trimmed)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("gallery_workflow");
+        let stem = base
+            .strip_suffix(".png")
+            .or_else(|| base.strip_suffix(".PNG"))
+            .or_else(|| base.strip_suffix(".json"))
+            .unwrap_or(base);
+        let safe_name = format!(
+            "{}.json",
+            stem.chars()
+                .map(
+                    |c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                )
+                .collect::<String>()
+        );
+        if workflow_json.trim().is_empty() {
+            return Err(CoreError::InvalidInput {
+                detail: "工作流 JSON 为空，无法发回画布".to_string(),
+            });
+        }
+        let ctl_sock = {
+            let h = self.handles.lock().await;
+            h.ctl_sock.clone()
+        }
+        .ok_or_else(|| CoreError::TunnelFailed {
+            detail: "当前没有已连接的 SSH 隧道，无法写入工作流".to_string(),
+        })?;
+        upload_workflow_to_remote(&ctl_sock, &safe_name, &workflow_json, self.runner.as_ref())
+            .await?;
+        self.push_log(format!(
+            "已将画廊工作流 {safe_name} 写入远端 ComfyUI workflows/ 目录。"
+        ))
+        .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn apply_preset_workflow(&self, preset_id: String) -> Result<AppSnapshot, CoreError> {
+        let (wf_name, wf_json) = {
+            let guard = self.state.lock().await;
+            let p = guard
+                .catalog_presets
+                .iter()
+                .find(|p| p.id == preset_id)
+                .ok_or_else(|| CoreError::InvalidInput {
+                    detail: format!("未找到预设：{preset_id}"),
+                })?;
+            match (&p.workflow_filename, &p.workflow_json) {
+                (Some(n), Some(j)) => (n.clone(), j.clone()),
+                _ => {
+                    return Err(CoreError::InvalidInput {
+                        detail: "该预设暂未内置工作流模板".to_string(),
+                    })
+                }
+            }
+        };
+        let ctl_sock = {
+            let h = self.handles.lock().await;
+            h.ctl_sock.clone()
+        }
+        .ok_or_else(|| CoreError::TunnelFailed {
+            detail: "当前没有已连接的 SSH 隧道，无法写入工作流".to_string(),
+        })?;
+        upload_workflow_to_remote(&ctl_sock, &wf_name, &wf_json, self.runner.as_ref()).await?;
+        self.push_log(format!(
+            "已将配套工作流 {wf_name} 写入远端 ComfyUI workflows/ 目录。"
+        ))
+        .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn sync_outputs_now(&self) -> Result<usize, CoreError> {
+        let _sync_guard = self.sync_mutex.lock().await;
+        let (local_port, cfg) = {
+            let guard = self.state.lock().await;
+            if !guard.tunnel_connected {
+                return Ok(0);
+            }
+            (self.local_proxy_port, guard.config.clone())
+        };
+        if local_port == 0 {
+            return Ok(0);
+        }
+        let body = fetch_local_comfy_json_long(local_port, "/history")
+            .await
+            .map_err(|detail| CoreError::TunnelFailed { detail })?;
+        let outputs = extract_history_outputs(&body);
+        let (img_dir, vid_dir) = self.effective_sync_dirs(&cfg);
+        let cursor_path = sync_cursor_path(&self.data_dir);
+        let mut cursor: SyncCursor = load_json_opt(&cursor_path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut added = 0usize;
+        for out_ref in outputs {
+            if cursor.contains(&out_ref.prompt_id, &out_ref.subfolder, &out_ref.filename) {
+                continue;
+            }
+            if download_output_to_local_dir(local_port, &out_ref, &img_dir, &vid_dir)
+                .await
+                .is_ok()
+            {
+                cursor.insert(&out_ref.prompt_id, &out_ref.subfolder, &out_ref.filename);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            let _ = save_json_0600(&cursor_path, &cursor);
+            let items = tokio::task::spawn_blocking(move || list_gallery_items(&img_dir, &vid_dir))
+                .await
+                .unwrap_or_default();
+            let mut guard = self.state.lock().await;
+            guard.synced_count += added;
+            guard.gallery_items = items;
+            self.notify_snapshot();
+        }
+        Ok(added)
+    }
+
     pub async fn confirm_drive_auth(&self) -> AppSnapshot {
         self.drive_action_tx
             .send_replace(Some(DriveUserAction::Continue));
@@ -1136,6 +1612,15 @@ impl SessionManager {
             .ok_or_else(|| CoreError::MissingBinary {
                 name: "colab".to_string(),
             })
+    }
+
+    pub async fn refresh_hf_token_status(&self) -> bool {
+        let configured = has_hf_token(self.runner.as_ref()).await;
+        {
+            let mut guard = self.state.lock().await;
+            guard.hf_token_configured = configured;
+        }
+        configured
     }
 
     /// Reconciles `pending-session.json` and `active-session.json` against Colab on startup.
@@ -1465,6 +1950,11 @@ impl SessionManager {
         {
             let mut guard = self.state.lock().await;
             guard.env = env.clone();
+        }
+        let hf_configured = has_hf_token(self.runner.as_ref()).await;
+        {
+            let mut guard = self.state.lock().await;
+            guard.hf_token_configured = hf_configured;
         }
         if let Ok(colab_bin) = self.require_colab_bin(&env) {
             let _ = self.refresh_account_and_sessions(&colab_bin).await;
@@ -2474,7 +2964,157 @@ impl SessionManager {
         self.notify_snapshot();
         self.spawn_tunnel_supervisor();
         self.spawn_telemetry_supervisor();
+        self.spawn_output_sync_supervisor();
         Ok(())
+    }
+
+    fn spawn_output_sync_supervisor(&self) {
+        let local_port = self.local_proxy_port;
+        if local_port == 0 {
+            return;
+        }
+        let data_dir = self.data_dir.clone();
+        let home_dir = self.home_dir.clone();
+        let state = self.state.clone();
+        let intentional_stop = self.intentional_stop.clone();
+        let snapshot_tx = self.snapshot_tx.clone();
+        let handles_ref = self.handles.clone();
+        let sync_mutex = self.sync_mutex.clone();
+
+        let task = tokio::spawn(async move {
+            loop {
+                if intentional_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let (connected, cfg) = {
+                    let guard = state.lock().await;
+                    (guard.tunnel_connected, guard.config.clone())
+                };
+                if !connected || !cfg.auto_sync_outputs {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                let img_dir = cfg
+                    .sync_images_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| default_images_dir(home_dir.as_deref()));
+                let vid_dir = cfg
+                    .sync_videos_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| default_videos_dir(home_dir.as_deref()));
+                let cursor_path = sync_cursor_path(&data_dir);
+
+                // Catch up via /history on connect/reconnect
+                if let Ok(body) = fetch_local_comfy_json_long(local_port, "/history").await {
+                    let _sync_guard = sync_mutex.lock().await;
+                    let outputs = extract_history_outputs(&body);
+                    let mut cursor: SyncCursor = load_json_opt(&cursor_path)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let mut added = 0usize;
+                    for out_ref in outputs {
+                        if cursor.contains(
+                            &out_ref.prompt_id,
+                            &out_ref.subfolder,
+                            &out_ref.filename,
+                        ) {
+                            continue;
+                        }
+                        if download_output_to_local_dir(local_port, &out_ref, &img_dir, &vid_dir)
+                            .await
+                            .is_ok()
+                        {
+                            cursor.insert(
+                                &out_ref.prompt_id,
+                                &out_ref.subfolder,
+                                &out_ref.filename,
+                            );
+                            added += 1;
+                        }
+                    }
+                    if added > 0 {
+                        let _ = save_json_0600(&cursor_path, &cursor);
+                        let img_c = img_dir.clone();
+                        let vid_c = vid_dir.clone();
+                        let items =
+                            tokio::task::spawn_blocking(move || list_gallery_items(&img_c, &vid_c))
+                                .await
+                                .unwrap_or_default();
+                        let mut guard = state.lock().await;
+                        guard.synced_count += added;
+                        guard.gallery_items = items;
+                        bump_snapshot(&snapshot_tx);
+                    }
+                }
+
+                // Stream /ws executed events
+                let _ = read_ws_executed_once(local_port, |outs| {
+                    let img_dir = img_dir.clone();
+                    let vid_dir = vid_dir.clone();
+                    let cursor_path = cursor_path.clone();
+                    let state = state.clone();
+                    let snapshot_tx = snapshot_tx.clone();
+                    let sync_mutex = sync_mutex.clone();
+                    async move {
+                        let _sync_guard = sync_mutex.lock().await;
+                        let mut cursor: SyncCursor = load_json_opt(&cursor_path)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let mut added = 0usize;
+                        for out_ref in outs {
+                            if cursor.contains(
+                                &out_ref.prompt_id,
+                                &out_ref.subfolder,
+                                &out_ref.filename,
+                            ) {
+                                continue;
+                            }
+                            if download_output_to_local_dir(
+                                local_port, &out_ref, &img_dir, &vid_dir,
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                cursor.insert(
+                                    &out_ref.prompt_id,
+                                    &out_ref.subfolder,
+                                    &out_ref.filename,
+                                );
+                                added += 1;
+                            }
+                        }
+                        if added > 0 {
+                            let _ = save_json_0600(&cursor_path, &cursor);
+                            let items = tokio::task::spawn_blocking(move || {
+                                list_gallery_items(&img_dir, &vid_dir)
+                            })
+                            .await
+                            .unwrap_or_default();
+                            let mut guard = state.lock().await;
+                            guard.synced_count += added;
+                            guard.gallery_items = items;
+                            bump_snapshot(&snapshot_tx);
+                        }
+                    }
+                })
+                .await;
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let mut h = handles_ref.lock().await;
+                if let Some(old) = h.sync_task.replace(task) {
+                    old.abort();
+                }
+            });
+        }
     }
 
     async fn ensure_drive_mounted_with_prompt(
@@ -2773,6 +3413,7 @@ impl SessionManager {
         let logs_ref = self.logs.clone();
         let data_dir_ref = self.data_dir.clone();
         let low_balance_notified = self.low_balance_notified.clone();
+        let download_in_flight = self.download_in_flight.clone();
 
         {
             let now_mono = clock.now_monotonic();
@@ -2830,6 +3471,9 @@ impl SessionManager {
                             fresh_queue_idle = Some(running == 0 && pending == 0);
                         }
                     }
+                }
+                if download_in_flight.load(Ordering::SeqCst) {
+                    fresh_queue_idle = Some(false);
                 }
 
                 // Tier 2 (every ~21s): single probe over existing ControlMaster socket (zero extra SSH)
@@ -3132,7 +3776,7 @@ impl SessionManager {
     }
 
     async fn teardown_local_handles(&self) {
-        let (proxy, mut tunnel_proc, ctl_sock, comfy_sock, sup, telem) = {
+        let (proxy, mut tunnel_proc, ctl_sock, comfy_sock, sup, telem, sync_t) = {
             let mut h = self.handles.lock().await;
             (
                 h.proxy.take(),
@@ -3141,12 +3785,16 @@ impl SessionManager {
                 h.comfy_sock.take(),
                 h.supervisor_task.take(),
                 h.telemetry_task.take(),
+                h.sync_task.take(),
             )
         };
         if let Some(task) = sup {
             task.abort();
         }
         if let Some(task) = telem {
+            task.abort();
+        }
+        if let Some(task) = sync_t {
             task.abort();
         }
         if let Some(p) = proxy {
@@ -3165,10 +3813,12 @@ impl SessionManager {
             wd.snapshot(now_mono)
         };
         self.low_balance_notified.store(false, Ordering::SeqCst);
+        self.download_in_flight.store(false, Ordering::SeqCst);
         let mut guard = self.state.lock().await;
         guard.tunnel_connected = false;
         guard.watchdog = wd_snap;
         guard.low_balance_warning = false;
+        guard.download_progress = None;
     }
 
     /// Stops the active (or pending) Colab session and runs triple verification.
