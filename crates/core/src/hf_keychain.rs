@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::time::Duration;
 
 use crate::runner::{CommandRunner, CommandSpec, StdinPolicy};
@@ -6,10 +7,11 @@ use crate::CoreError;
 pub const SECURITY_BIN: &str = "/usr/bin/security";
 pub const HF_KEYCHAIN_SERVICE: &str = "io.github.cmochance.colab-comfyui";
 pub const HF_KEYCHAIN_ACCOUNT: &str = "hf_token";
+pub const GATEWAY_KEYCHAIN_ACCOUNT: &str = "gateway_api_key";
 
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn build_security_interactive_set_cmd(token: &str) -> Result<String, CoreError> {
+fn build_security_interactive_set_cmd(account: &str, token: &str) -> Result<String, CoreError> {
     let trimmed = token.trim();
     if trimmed.is_empty()
         || !trimmed
@@ -17,18 +19,20 @@ fn build_security_interactive_set_cmd(token: &str) -> Result<String, CoreError> 
             .all(|c| c.is_ascii_graphic() && !matches!(c, '"' | '\'' | '\\'))
     {
         return Err(CoreError::InvalidInput {
-            detail: "HF_TOKEN 仅允许无空白、无引号的可见 ASCII 字符".to_string(),
+            detail: "密钥仅允许无空白、无引号的可见 ASCII 字符".to_string(),
         });
     }
     Ok(format!(
-        "add-generic-password -U -a \"{HF_KEYCHAIN_ACCOUNT}\" -s \"{HF_KEYCHAIN_SERVICE}\" -w \"{trimmed}\"\n"
+        "add-generic-password -U -a \"{account}\" -s \"{HF_KEYCHAIN_SERVICE}\" -w \"{trimmed}\"\n"
     ))
 }
 
-/// Stores `hf_token` in macOS Keychain via `/usr/bin/security -i` stdin so the token
-/// never appears in process `argv`.
-pub async fn set_hf_token(token: &str, runner: &dyn CommandRunner) -> Result<(), CoreError> {
-    let script = build_security_interactive_set_cmd(token)?;
+async fn set_keychain_secret(
+    account: &str,
+    secret: &str,
+    runner: &dyn CommandRunner,
+) -> Result<(), CoreError> {
+    let script = build_security_interactive_set_cmd(account, secret)?;
     let mut spec = CommandSpec::new(
         SECURITY_BIN.to_string(),
         vec!["-i".to_string()],
@@ -40,20 +44,22 @@ pub async fn set_hf_token(token: &str, runner: &dyn CommandRunner) -> Result<(),
         return Err(CoreError::CommandFailed {
             command: "security -i add-generic-password".to_string(),
             exit_code: out.exit_code,
-            stderr: "写入 Hugging Face Token 到钥匙串失败".to_string(),
+            stderr: format!("写入 {account} 到钥匙串失败"),
         });
     }
     Ok(())
 }
 
-/// Reads `hf_token` from macOS Keychain (`None` if not stored).
-pub async fn get_hf_token(runner: &dyn CommandRunner) -> Result<Option<String>, CoreError> {
+async fn get_keychain_secret(
+    account: &str,
+    runner: &dyn CommandRunner,
+) -> Result<Option<String>, CoreError> {
     let spec = CommandSpec::new(
         SECURITY_BIN.to_string(),
         vec![
             "find-generic-password".to_string(),
             "-a".to_string(),
-            HF_KEYCHAIN_ACCOUNT.to_string(),
+            account.to_string(),
             "-s".to_string(),
             HF_KEYCHAIN_SERVICE.to_string(),
             "-w".to_string(),
@@ -82,19 +88,16 @@ pub async fn get_hf_token(runner: &dyn CommandRunner) -> Result<Option<String>, 
     })
 }
 
-/// Checks whether `hf_token` is present in macOS Keychain without returning the secret.
-pub async fn has_hf_token(runner: &dyn CommandRunner) -> bool {
-    matches!(get_hf_token(runner).await, Ok(Some(_)))
-}
-
-/// Deletes `hf_token` from macOS Keychain (idempotent when missing).
-pub async fn delete_hf_token(runner: &dyn CommandRunner) -> Result<(), CoreError> {
+async fn delete_keychain_secret(
+    account: &str,
+    runner: &dyn CommandRunner,
+) -> Result<(), CoreError> {
     let spec = CommandSpec::new(
         SECURITY_BIN.to_string(),
         vec![
             "delete-generic-password".to_string(),
             "-a".to_string(),
-            HF_KEYCHAIN_ACCOUNT.to_string(),
+            account.to_string(),
             "-s".to_string(),
             HF_KEYCHAIN_SERVICE.to_string(),
         ],
@@ -112,6 +115,66 @@ pub async fn delete_hf_token(runner: &dyn CommandRunner) -> Result<(), CoreError
         exit_code: out.exit_code,
         stderr: out.stderr,
     })
+}
+
+/// Stores `hf_token` in macOS Keychain via `/usr/bin/security -i` stdin so the token
+/// never appears in process `argv`.
+pub async fn set_hf_token(token: &str, runner: &dyn CommandRunner) -> Result<(), CoreError> {
+    set_keychain_secret(HF_KEYCHAIN_ACCOUNT, token, runner).await
+}
+
+/// Reads `hf_token` from macOS Keychain (`None` if not stored).
+pub async fn get_hf_token(runner: &dyn CommandRunner) -> Result<Option<String>, CoreError> {
+    get_keychain_secret(HF_KEYCHAIN_ACCOUNT, runner).await
+}
+
+/// Checks whether `hf_token` is present in macOS Keychain without returning the secret.
+pub async fn has_hf_token(runner: &dyn CommandRunner) -> bool {
+    matches!(get_hf_token(runner).await, Ok(Some(_)))
+}
+
+/// Deletes `hf_token` from macOS Keychain (idempotent when missing).
+pub async fn delete_hf_token(runner: &dyn CommandRunner) -> Result<(), CoreError> {
+    delete_keychain_secret(HF_KEYCHAIN_ACCOUNT, runner).await
+}
+
+/// Generates a random local API key (`ccu_` + 32 hex chars) using `/dev/urandom`.
+pub fn generate_gateway_api_key() -> Result<String, CoreError> {
+    let mut buf = [0u8; 16];
+    let mut f = std::fs::File::open("/dev/urandom").map_err(|source| CoreError::Io {
+        context: "open /dev/urandom".to_string(),
+        source,
+    })?;
+    f.read_exact(&mut buf).map_err(|source| CoreError::Io {
+        context: "read /dev/urandom".to_string(),
+        source,
+    })?;
+    Ok(format!("ccu_{}", hex::encode(buf)))
+}
+
+pub async fn set_gateway_api_key(key: &str, runner: &dyn CommandRunner) -> Result<(), CoreError> {
+    set_keychain_secret(GATEWAY_KEYCHAIN_ACCOUNT, key, runner).await
+}
+
+pub async fn get_gateway_api_key(runner: &dyn CommandRunner) -> Result<Option<String>, CoreError> {
+    get_keychain_secret(GATEWAY_KEYCHAIN_ACCOUNT, runner).await
+}
+
+pub async fn has_gateway_api_key(runner: &dyn CommandRunner) -> bool {
+    matches!(get_gateway_api_key(runner).await, Ok(Some(_)))
+}
+
+pub async fn delete_gateway_api_key(runner: &dyn CommandRunner) -> Result<(), CoreError> {
+    delete_keychain_secret(GATEWAY_KEYCHAIN_ACCOUNT, runner).await
+}
+
+pub async fn ensure_gateway_api_key(runner: &dyn CommandRunner) -> Result<String, CoreError> {
+    if let Some(existing) = get_gateway_api_key(runner).await? {
+        return Ok(existing);
+    }
+    let key = generate_gateway_api_key()?;
+    set_gateway_api_key(&key, runner).await?;
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -177,9 +240,27 @@ mod tests {
     fn set_hf_token_rejects_quotes_whitespace_and_backslash() {
         for bad in ["hf_bad\"quote", "hf_bad space", "hf_bad\\slash", ""] {
             assert!(
-                build_security_interactive_set_cmd(bad).is_err(),
+                build_security_interactive_set_cmd(HF_KEYCHAIN_ACCOUNT, bad).is_err(),
                 "expected error for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn gateway_api_key_generates_ccu_prefix_and_stores_via_stdin() {
+        let key = generate_gateway_api_key().unwrap();
+        assert!(key.starts_with("ccu_"));
+        assert_eq!(key.len(), 36);
+        let runner = CaptureRunner {
+            seen_args: Mutex::new(Vec::new()),
+            seen_stdin: Mutex::new(Vec::new()),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(set_gateway_api_key(&key, &runner)).unwrap();
+        let stdin = runner.seen_stdin.lock().unwrap();
+        assert!(stdin[0].contains("add-generic-password -U -a \"gateway_api_key\""));
+        assert!(stdin[0].contains(&key));
     }
 }

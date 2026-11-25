@@ -14,6 +14,8 @@ use crate::CoreError;
 
 pub const LOCAL_PROXY_PORT: u16 = 18188;
 pub const REMOTE_COMFY_PORT: u16 = 8188;
+pub const GATEWAY_PROXY_PORT: u16 = 18080;
+pub const REMOTE_LLM_PORT: u16 = 8081;
 pub const MAX_UNIX_SOCKET_PATH_LEN: usize = 80;
 
 const CONFIG_FILE: &str = "config.json";
@@ -353,6 +355,11 @@ pub fn ctl_socket_path(data_dir: &Path, session_name: &str) -> Result<PathBuf, C
 /// Returns `<data_dir>/run/comfy.sock`, enforcing `< 80` bytes for macOS `sun_path`.
 pub fn comfy_socket_path(data_dir: &Path) -> Result<PathBuf, CoreError> {
     validate_socket_path(data_dir.join("run").join("comfy.sock"))
+}
+
+/// Returns `<data_dir>/run/llm.sock`, enforcing `< 80` bytes for macOS `sun_path`.
+pub fn llm_socket_path(data_dir: &Path) -> Result<PathBuf, CoreError> {
+    validate_socket_path(data_dir.join("run").join("llm.sock"))
 }
 
 pub fn ssh_key_path(data_dir: &Path) -> PathBuf {

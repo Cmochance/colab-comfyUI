@@ -88,7 +88,10 @@ pub async fn start_local_proxy(
     })
 }
 
-async fn lookup_port_owner(runner: &dyn CommandRunner, port: u16) -> (Option<u32>, Option<String>) {
+pub(crate) async fn lookup_port_owner(
+    runner: &dyn CommandRunner,
+    port: u16,
+) -> (Option<u32>, Option<String>) {
     let lsof = Path::new(LSOF_BIN);
     if !lsof.exists() {
         return (None, None);
