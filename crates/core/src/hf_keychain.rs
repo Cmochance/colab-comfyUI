@@ -12,17 +12,16 @@ const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
 fn build_security_interactive_set_cmd(token: &str) -> Result<String, CoreError> {
     let trimmed = token.trim();
     if trimmed.is_empty()
-        || trimmed.contains('\n')
-        || trimmed.contains('\r')
-        || trimmed.contains('\0')
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '"' | '\'' | '\\'))
     {
         return Err(CoreError::InvalidInput {
-            detail: "HF_TOKEN 不能为空或包含换行符".to_string(),
+            detail: "HF_TOKEN 仅允许无空白、无引号的可见 ASCII 字符".to_string(),
         });
     }
-    let escaped = trimmed.replace('\\', "\\\\").replace('"', "\\\"");
     Ok(format!(
-        "add-generic-password -U -a \"{HF_KEYCHAIN_ACCOUNT}\" -s \"{HF_KEYCHAIN_SERVICE}\" -w \"{escaped}\"\n"
+        "add-generic-password -U -a \"{HF_KEYCHAIN_ACCOUNT}\" -s \"{HF_KEYCHAIN_SERVICE}\" -w \"{trimmed}\"\n"
     ))
 }
 
@@ -172,5 +171,15 @@ mod tests {
             "add-generic-password -U -a \"hf_token\" -s \"io.github.cmochance.colab-comfyui\""
         ));
         assert!(stdin[0].contains(secret));
+    }
+
+    #[test]
+    fn set_hf_token_rejects_quotes_whitespace_and_backslash() {
+        for bad in ["hf_bad\"quote", "hf_bad space", "hf_bad\\slash", ""] {
+            assert!(
+                build_security_interactive_set_cmd(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
     }
 }

@@ -195,9 +195,9 @@
       export_outputs_on_stop: boolean;
       drive_export_timeout_secs: number;
       watchdog_idle_minutes: number | null;
-      auto_sync_outputs?: boolean;
-      sync_images_dir?: string | null;
-      sync_videos_dir?: string | null;
+      auto_sync_outputs: boolean;
+      sync_images_dir: string | null;
+      sync_videos_dir: string | null;
       privacy_mask: boolean;
     };
     account_email: string | null;
@@ -262,11 +262,17 @@
   let exitBusy = $state(false);
   let agyBusy = $state(false);
   let catalogBusy = $state(false);
+  let syncBusy = $state(false);
+  let galleryExpanded = $state(false);
   let downloadStorage = $state<'Drive' | 'VmContent'>('Drive');
   let hfTokenInput = $state('');
   let customHfInput = $state('');
   let customHfSubdir = $state('checkpoints');
+  let autoSyncOutputs = $state(true);
+  let syncImagesDir = $state('');
+  let syncVideosDir = $state('');
   let selectedGalleryItem = $state<GalleryItem | null>(null);
+  let copiedHint = $state(false);
   let logsExpanded = $state(false);
   let showZeroCuModal = $state(false);
   let showExitModal = $state(false);
@@ -294,9 +300,26 @@
     return () => clearInterval(timer);
   });
 
+  const driveMounted = $derived(
+    snap?.active_session ? snap.active_session.drive_enabled : useDrive
+  );
+  const detectedVramGb = $derived(
+    snap?.telemetry.vram_total_bytes
+      ? Math.round(snap.telemetry.vram_total_bytes / (1024 * 1024 * 1024))
+      : null
+  );
+
   function formatGiB(bytes: number | null | undefined): string {
     if (bytes == null) return '--';
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+
+  function formatBytes(bytes: number | null | undefined): string {
+    if (bytes == null) return '--';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   }
 
   function formatDurationMinutes(mins: number | null | undefined): string {
@@ -382,6 +405,9 @@
         exportOutputsOnStop = s.config.export_outputs_on_stop;
         driveExportTimeoutSecs = s.config.drive_export_timeout_secs ?? 90;
         privacyMask = s.config.privacy_mask;
+        autoSyncOutputs = s.config.auto_sync_outputs;
+        syncImagesDir = s.config.sync_images_dir ?? '';
+        syncVideosDir = s.config.sync_videos_dir ?? '';
         configSynced = true;
       }
     });
@@ -730,19 +756,65 @@
   }
 
   async function runApplyWorkflow(presetId: string) {
+    catalogBusy = true;
     try {
+      actionError = null;
       snap = await invoke<AppSnapshot>('apply_preset_workflow', { presetId });
     } catch (err) {
       actionError = err as UiError;
+    } finally {
+      catalogBusy = false;
     }
   }
 
   async function runSyncNow() {
+    syncBusy = true;
     try {
+      actionError = null;
       await invoke<number>('sync_outputs_now');
       snap = await invoke<AppSnapshot>('refresh_gallery');
     } catch (err) {
       actionError = err as UiError;
+    } finally {
+      syncBusy = false;
+    }
+  }
+
+  async function runSaveSyncPrefs() {
+    syncBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>('set_sync_preferences', {
+        autoSync: autoSyncOutputs,
+        imagesDir: syncImagesDir.trim() ? syncImagesDir.trim() : null,
+        videosDir: syncVideosDir.trim() ? syncVideosDir.trim() : null
+      });
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      syncBusy = false;
+    }
+  }
+
+  async function runCopyPrompt(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copiedHint = true;
+      setTimeout(() => (copiedHint = false), 2000);
+    } catch {
+      // Fallback ignored; text remains selectable in UI
+    }
+  }
+
+  async function runSendWorkflowToCanvas(filename: string, workflowJson: string) {
+    catalogBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>('send_workflow_to_canvas', { filename, workflowJson });
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      catalogBusy = false;
     }
   }
 
@@ -753,6 +825,12 @@
       actionError = err as UiError;
     }
   }
+
+  $effect(() => {
+    if (!driveMounted && downloadStorage === 'Drive') {
+      downloadStorage = 'VmContent';
+    }
+  });
 </script>
 
 <div class="app-shell" class:masked={privacyMask}>
@@ -1157,12 +1235,17 @@
 
   <section class="card">
     <div class="row-between">
-      <h2>{snap?.config.locale === 'en' ? 'Model & Workflow Catalog' : '模型与工作流中心'}</h2>
+      <h2>{t('catalog_title', '模型与工作流中心（已核实路径）')}</h2>
       <select bind:value={downloadStorage} disabled={catalogBusy}>
-        <option value="Drive">Google Drive</option>
-        <option value="VmContent">VM /content</option>
+        <option value="Drive" disabled={!driveMounted}>
+          {t('catalog_storage_drive', '持久化到 Google Drive')}
+        </option>
+        <option value="VmContent">{t('catalog_storage_vm', '仅 VM /content（临时高速）')}</option>
       </select>
     </div>
+    {#if !driveMounted}
+      <p class="hint">{t('catalog_storage_drive_disabled', '当前未挂载 Drive，已自动切换至 VM /content')}</p>
+    {/if}
     <p class="hint">
       {snap?.config.locale === 'en'
         ? 'HF_TOKEN is stored in macOS Keychain and enters remote VM memory only during download (use a fine-grained read-only token).'
@@ -1171,20 +1254,22 @@
     <div class="controls">
       <input
         type="password"
-        placeholder="hf_..."
+        placeholder={t('hf_token_placeholder', '输入 hf_...（仅存本机钥匙串）')}
         bind:value={hfTokenInput}
         disabled={catalogBusy}
       />
       <button class="secondary" onclick={runSaveHfToken} disabled={catalogBusy || !hfTokenInput.trim()}>
-        {snap?.hf_token_configured ? '更新 HF_TOKEN' : '保存 HF_TOKEN'}
+        {t('hf_token_save_btn', '保存 HF Token')}{snap?.hf_token_configured ? ` (${t('hf_token_configured', '已配置')})` : ''}
       </button>
       {#if snap?.hf_token_configured}
-        <button class="secondary" onclick={runClearHfToken} disabled={catalogBusy}>清除</button>
+        <button class="secondary" onclick={runClearHfToken} disabled={catalogBusy}>
+          {t('hf_token_clear_btn', '清除 Token')}
+        </button>
       {/if}
     </div>
     {#if snap?.download_progress}
       <p class="banner info">
-        {snap.download_progress.current_file}: {snap.download_progress.percent}% {snap.download_progress.speed}
+        ({snap.download_progress.file_index}/{snap.download_progress.total_files}) {snap.download_progress.current_file}: {snap.download_progress.percent}% {snap.download_progress.speed}
       </p>
     {/if}
     <div class="telemetry-grid">
@@ -1192,13 +1277,20 @@
         <div class="metric">
           <strong>{preset.name} ({formatGiB(preset.total_bytes)}, {preset.min_vram_gb}GB+ VRAM)</strong>
           <span class="hint">{snap?.config.locale === 'en' ? preset.description_en : preset.description_zh}</span>
+          {#if detectedVramGb !== null && detectedVramGb < preset.min_vram_gb}
+            <span class="hint" style="color: #b45309;">
+              {t('catalog_vram_warning', '显存可能不足（需 {min} GB，当前约 {cur} GB）')
+                .replace('{min}', String(preset.min_vram_gb))
+                .replace('{cur}', String(detectedVramGb))}
+            </span>
+          {/if}
           <div class="controls">
             <button
               class="primary"
               disabled={!snap?.tunnel_connected || catalogBusy}
               onclick={() => runDownloadPreset(preset.id)}
             >
-              下载模型
+              {t('catalog_download_btn', '下载模型')}
             </button>
             {#if preset.workflow_filename}
               <button
@@ -1206,7 +1298,7 @@
                 disabled={!snap?.tunnel_connected || catalogBusy}
                 onclick={() => runApplyWorkflow(preset.id)}
               >
-                写入工作流
+                {t('catalog_apply_workflow_btn', '写入工作流')}
               </button>
             {/if}
           </div>
@@ -1216,7 +1308,7 @@
     <div class="controls">
       <input
         type="text"
-        placeholder="https://huggingface.co/.../resolve/main/file.safetensors 或 owner/repo:path/file.safetensors"
+        placeholder={t('catalog_custom_input_placeholder', '粘贴 HF 链接或 repo:path')}
         bind:value={customHfInput}
         disabled={catalogBusy}
       />
@@ -1235,7 +1327,7 @@
         disabled={!snap?.tunnel_connected || catalogBusy || !customHfInput.trim()}
         onclick={runDownloadCustomHf}
       >
-        导入自定义 HF 模型
+        {t('catalog_custom_download_btn', '下载自定义模型')}
       </button>
     </div>
   </section>
@@ -1243,23 +1335,53 @@
   <section class="card">
     <div class="row-between">
       <h2>
-        {snap?.config.locale === 'en' ? 'Synced Output Gallery' : '本地作品画廊'} ({snap?.gallery_items?.length ?? 0})
+        {t('gallery_title', '成品回传与本地画廊')} ({snap?.gallery_items?.length ?? 0})
       </h2>
       <div class="controls">
-        <button class="secondary" disabled={!snap?.tunnel_connected} onclick={runSyncNow}>
-          {snap?.config.locale === 'en' ? 'Sync Now' : '立即同步成品'}
+        <button class="secondary" disabled={!snap?.tunnel_connected || syncBusy} onclick={runSyncNow}>
+          {t('gallery_sync_now_btn', '立即同步')}
         </button>
+        {#if (snap?.gallery_items?.length ?? 0) > 12}
+          <button class="secondary" onclick={() => (galleryExpanded = !galleryExpanded)}>
+            {galleryExpanded
+              ? t('gallery_collapse_all_btn', '收起列表')
+              : t('gallery_expand_all_btn', '展开全部')}
+          </button>
+        {/if}
       </div>
+    </div>
+    <div class="controls" style="margin-bottom: 0.75rem;">
+      <label>
+        <input type="checkbox" bind:checked={autoSyncOutputs} disabled={syncBusy} />
+        {t('sync_auto_label', '自动同步生成成品到本地')}
+      </label>
+      <input
+        type="text"
+        placeholder={`${t('sync_images_dir_label', '图片目录')} (~/Pictures/ColabComfyUI)`}
+        bind:value={syncImagesDir}
+        disabled={syncBusy}
+      />
+      <input
+        type="text"
+        placeholder={`${t('sync_videos_dir_label', '视频目录')} (~/Movies/ColabComfyUI)`}
+        bind:value={syncVideosDir}
+        disabled={syncBusy}
+      />
+      <button class="secondary" onclick={runSaveSyncPrefs} disabled={syncBusy}>
+        {t('sync_save_dirs_btn', '保存同步设置')}
+      </button>
     </div>
     {#if snap?.gallery_items?.length}
       <div class="telemetry-grid">
-        {#each snap.gallery_items.slice(0, 12) as item}
+        {#each galleryExpanded ? snap.gallery_items : snap.gallery_items.slice(0, 12) as item}
           <div class="metric">
             <strong class="sensitive">{item.filename}</strong>
-            <span class="hint">{formatGiB(item.size_bytes)}</span>
+            <span class="hint">{formatBytes(item.size_bytes)}</span>
             <div class="controls">
               <button class="secondary" onclick={() => (selectedGalleryItem = item)}>参数</button>
-              <button class="secondary" onclick={() => runRevealGalleryItem(item.path)}>Finder</button>
+              <button class="secondary" onclick={() => runRevealGalleryItem(item.path)}>
+                {t('gallery_reveal_btn', '在 Finder 显示')}
+              </button>
             </div>
           </div>
         {/each}
@@ -1268,21 +1390,44 @@
         <div class="banner info">
           <strong>{selectedGalleryItem.filename}</strong>
           {#if selectedGalleryItem.metadata}
-            <p class="sensitive">Prompt: {selectedGalleryItem.metadata.positive_prompt ?? '--'}</p>
+            <p class="sensitive" style="user-select: text;">
+              Prompt: {selectedGalleryItem.metadata.positive_prompt ?? '--'}
+            </p>
             <p class="hint">
               Model: {selectedGalleryItem.metadata.model ?? '--'} · Seed: {selectedGalleryItem.metadata.seed ?? '--'} · Steps: {selectedGalleryItem.metadata.steps ?? '--'} · CFG: {selectedGalleryItem.metadata.cfg ?? '--'}
             </p>
+            <div class="controls">
+              {#if selectedGalleryItem.metadata.positive_prompt}
+                <button
+                  class="secondary"
+                  onclick={() => runCopyPrompt(selectedGalleryItem?.metadata?.positive_prompt ?? '')}
+                >
+                  {copiedHint
+                    ? t('gallery_copied_notice', '已复制到剪贴板')
+                    : t('gallery_copy_prompt_btn', '复制 Prompt')}
+                </button>
+              {/if}
+              {#if selectedGalleryItem.metadata.workflow_json}
+                <button
+                  class="secondary"
+                  disabled={!snap?.tunnel_connected || catalogBusy}
+                  onclick={() =>
+                    runSendWorkflowToCanvas(
+                      selectedGalleryItem?.filename ?? 'workflow',
+                      selectedGalleryItem?.metadata?.workflow_json ?? ''
+                    )}
+                >
+                  {t('gallery_send_workflow_btn', '发回画布')}
+                </button>
+              {/if}
+            </div>
           {:else}
-            <p class="hint">未包含 ComfyUI PNG 工作流元数据</p>
+            <p class="hint">{t('gallery_no_metadata', '该文件无 ComfyUI 嵌入元数据')}</p>
           {/if}
         </div>
       {/if}
     {:else}
-      <p class="hint">
-        {snap?.config.locale === 'en'
-          ? 'Generated images & videos auto-sync to ~/Pictures/ColabComfyUI and ~/Movies/ColabComfyUI.'
-          : '生成的图片与视频将自动回传至 ~/Pictures/ColabComfyUI 与 ~/Movies/ColabComfyUI。'}
-      </p>
+      <p class="hint">{t('gallery_empty', '暂无已同步成品')}</p>
     {/if}
   </section>
 

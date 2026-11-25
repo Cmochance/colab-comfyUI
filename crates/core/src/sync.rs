@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -58,39 +59,50 @@ pub fn default_videos_dir(home_dir: Option<&Path>) -> PathBuf {
 
 /// Pure-Rust PNG `tEXt` / uncompressed `iTXt` chunk parser extracting ComfyUI `prompt` & `workflow`.
 pub fn parse_png_comfy_metadata(bytes: &[u8]) -> Option<PngComfyMetadata> {
+    parse_png_comfy_metadata_reader(Cursor::new(bytes))
+}
+
+/// Streaming PNG `tEXt` / uncompressed `iTXt` parser that seeks past `IDAT` and other non-text chunks.
+pub fn parse_png_comfy_metadata_reader<R: Read + Seek>(mut reader: R) -> Option<PngComfyMetadata> {
     const PNG_SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    if bytes.len() < 8 || &bytes[..8] != PNG_SIG {
+    const MAX_TEXT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+    let mut sig = [0u8; 8];
+    reader.read_exact(&mut sig).ok()?;
+    if &sig != PNG_SIG {
         return None;
     }
 
-    let mut pos = 8usize;
     let mut prompt_json: Option<String> = None;
     let mut workflow_json: Option<String> = None;
 
-    while pos + 12 <= bytes.len() {
-        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-            as usize;
-        let chunk_type = &bytes[pos + 4..pos + 8];
-        let data_start = pos + 8;
-        let Some(data_end) = data_start.checked_add(len) else {
-            break;
-        };
-        if data_end + 4 > bytes.len() {
+    loop {
+        let mut hdr = [0u8; 8];
+        if reader.read_exact(&mut hdr).is_err() {
             break;
         }
-        let data = &bytes[data_start..data_end];
-        if chunk_type == b"tEXt" {
-            if let Some(nul) = data.iter().position(|&b| b == 0) {
-                let key = std::str::from_utf8(&data[..nul]).unwrap_or("");
-                let val = String::from_utf8_lossy(&data[nul + 1..]).to_string();
-                match key {
-                    "prompt" => prompt_json = Some(val),
-                    "workflow" => workflow_json = Some(val),
-                    _ => {}
-                }
+        let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+        let chunk_type = &hdr[4..8];
+
+        if chunk_type == b"IEND" {
+            break;
+        }
+
+        if (chunk_type == b"tEXt" || chunk_type == b"iTXt") && len <= MAX_TEXT_CHUNK_BYTES {
+            let mut data = vec![0u8; len];
+            if reader.read_exact(&mut data).is_err() {
+                break;
             }
-        } else if chunk_type == b"iTXt" {
-            if let Some(nul1) = data.iter().position(|&b| b == 0) {
+            if chunk_type == b"tEXt" {
+                if let Some(nul) = data.iter().position(|&b| b == 0) {
+                    let key = std::str::from_utf8(&data[..nul]).unwrap_or("");
+                    let val = String::from_utf8_lossy(&data[nul + 1..]).to_string();
+                    match key {
+                        "prompt" => prompt_json = Some(val),
+                        "workflow" => workflow_json = Some(val),
+                        _ => {}
+                    }
+                }
+            } else if let Some(nul1) = data.iter().position(|&b| b == 0) {
                 let key = std::str::from_utf8(&data[..nul1]).unwrap_or("");
                 // iTXt layout: key \0 compression_flag(1) compression_method(1) lang \0 translated \0 text
                 if nul1 + 3 <= data.len() && data[nul1 + 1] == 0 {
@@ -108,10 +120,15 @@ pub fn parse_png_comfy_metadata(bytes: &[u8]) -> Option<PngComfyMetadata> {
                     }
                 }
             }
-        } else if chunk_type == b"IEND" {
-            break;
+            if reader.seek(SeekFrom::Current(4)).is_err() {
+                break;
+            }
+        } else {
+            let skip = i64::try_from(len).ok()?.checked_add(4)?;
+            if reader.seek(SeekFrom::Current(skip)).is_err() {
+                break;
+            }
         }
-        pos = data_end + 4;
     }
 
     if prompt_json.is_none() && workflow_json.is_none() {
@@ -219,7 +236,16 @@ fn populate_summary_from_prompt_graph(
 }
 
 pub fn list_gallery_items(images_dir: &Path, videos_dir: &Path) -> Vec<GalleryItem> {
-    let mut items = Vec::new();
+    struct Candidate {
+        path: PathBuf,
+        filename: String,
+        is_video: bool,
+        is_png: bool,
+        size_bytes: u64,
+        modified_unix: u64,
+    }
+
+    let mut candidates = Vec::new();
     for (dir, is_video) in [(images_dir, false), (videos_dir, true)] {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
@@ -251,26 +277,39 @@ pub fn list_gallery_items(images_dir: &Path, videos_dir: &Path) -> Vec<GalleryIt
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let png_meta = if ext == "png" {
-                fs::read(&path)
-                    .ok()
-                    .and_then(|b| parse_png_comfy_metadata(&b))
-            } else {
-                None
-            };
-            items.push(GalleryItem {
-                path: path.display().to_string(),
+            candidates.push(Candidate {
+                path,
                 filename: entry.file_name().to_string_lossy().to_string(),
                 is_video,
+                is_png: ext == "png",
                 size_bytes: meta.len(),
                 modified_unix,
-                metadata: png_meta,
             });
         }
     }
-    items.sort_by_key(|b| std::cmp::Reverse(b.modified_unix));
-    items.truncate(100);
-    items
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.modified_unix));
+    candidates.truncate(100);
+
+    candidates
+        .into_iter()
+        .map(|c| {
+            let png_meta = if c.is_png {
+                fs::File::open(&c.path)
+                    .ok()
+                    .and_then(|f| parse_png_comfy_metadata_reader(std::io::BufReader::new(f)))
+            } else {
+                None
+            };
+            GalleryItem {
+                path: c.path.display().to_string(),
+                filename: c.filename,
+                is_video: c.is_video,
+                size_bytes: c.size_bytes,
+                modified_unix: c.modified_unix,
+                metadata: png_meta,
+            }
+        })
+        .collect()
 }
 
 pub fn extract_history_outputs(history_json: &str) -> Vec<HistoryOutputRef> {
@@ -369,9 +408,10 @@ fn push_output_array(
     }
 }
 
-pub async fn fetch_local_comfy_bytes(
+pub async fn fetch_local_comfy_http(
     local_port: u16,
     path_and_query: &str,
+    read_timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     let mut stream = tokio::time::timeout(
         Duration::from_secs(10),
@@ -388,10 +428,29 @@ pub async fn fetch_local_comfy_bytes(
         .await
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut buf))
+    tokio::time::timeout(read_timeout, stream.read_to_end(&mut buf))
         .await
         .map_err(|_| "read timeout".to_string())?
         .map_err(|e| e.to_string())?;
+    parse_http_response(&buf)
+}
+
+pub async fn fetch_local_comfy_bytes(
+    local_port: u16,
+    path_and_query: &str,
+) -> Result<Vec<u8>, String> {
+    fetch_local_comfy_http(local_port, path_and_query, Duration::from_secs(120)).await
+}
+
+pub async fn fetch_local_comfy_json_long(
+    local_port: u16,
+    path_and_query: &str,
+) -> Result<String, String> {
+    let bytes = fetch_local_comfy_http(local_port, path_and_query, Duration::from_secs(30)).await?;
+    String::from_utf8(bytes).map_err(|e| format!("invalid UTF-8: {e}"))
+}
+
+fn parse_http_response(buf: &[u8]) -> Result<Vec<u8>, String> {
     let sep = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -403,7 +462,73 @@ pub async fn fetch_local_comfy_bytes(
             header.lines().next().unwrap_or("")
         ));
     }
-    Ok(buf[sep + 4..].to_vec())
+    let mut is_chunked = false;
+    let mut content_length: Option<usize> = None;
+    for line in header.lines().skip(1) {
+        if let Some((name, val)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && val.to_ascii_lowercase().contains("chunked")
+            {
+                is_chunked = true;
+            } else if name.trim().eq_ignore_ascii_case("content-length") {
+                let parsed = val
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| "invalid Content-Length".to_string())?;
+                content_length = Some(parsed);
+            }
+        }
+    }
+    let body = &buf[sep + 4..];
+    if is_chunked {
+        decode_chunked_body(body)
+    } else if let Some(expected) = content_length {
+        if body.len() != expected {
+            Err(format!(
+                "truncated HTTP body: expected {expected} bytes, got {}",
+                body.len()
+            ))
+        } else {
+            Ok(body.to_vec())
+        }
+    } else {
+        Ok(body.to_vec())
+    }
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut pos = 0usize;
+    let mut out = Vec::new();
+    loop {
+        let Some(rel_end) = body[pos..].windows(2).position(|w| w == b"\r\n") else {
+            return Err("truncated chunked HTTP header".to_string());
+        };
+        let line_bytes = &body[pos..pos + rel_end];
+        let line = std::str::from_utf8(line_bytes)
+            .map_err(|_| "invalid chunk size encoding".to_string())?;
+        let hex = line.split(';').next().unwrap_or("").trim();
+        let chunk_size =
+            usize::from_str_radix(hex, 16).map_err(|_| format!("invalid chunk size: {hex:?}"))?;
+        pos += rel_end + 2;
+        if chunk_size == 0 {
+            if pos + 2 > body.len() {
+                return Err("truncated chunked terminator".to_string());
+            }
+            return Ok(out);
+        }
+        let end = pos
+            .checked_add(chunk_size)
+            .and_then(|v| v.checked_add(2))
+            .ok_or_else(|| "chunk size overflow".to_string())?;
+        if end > body.len() {
+            return Err("truncated chunked HTTP body".to_string());
+        }
+        out.extend_from_slice(&body[pos..pos + chunk_size]);
+        if &body[pos + chunk_size..end] != b"\r\n" {
+            return Err("malformed chunked HTTP delimiter".to_string());
+        }
+        pos = end;
+    }
 }
 
 pub async fn download_output_to_local_dir(
@@ -433,13 +558,21 @@ pub async fn download_output_to_local_dir(
     let bytes = fetch_local_comfy_bytes(local_port, &query)
         .await
         .map_err(|detail| CoreError::TunnelFailed { detail })?;
-    let dest = deduplicate_dest_path(target_dir, &safe_name);
-    tokio::fs::write(&dest, &bytes)
+    let tmp_path = target_dir.join(format!(".tmp.{}.{}.part", std::process::id(), safe_name));
+    tokio::fs::write(&tmp_path, &bytes)
         .await
         .map_err(|source| CoreError::Io {
-            context: format!("write synced output {}", dest.display()),
+            context: format!("write temp synced output {}", tmp_path.display()),
             source,
         })?;
+    let dest = deduplicate_dest_path(target_dir, &safe_name);
+    if let Err(source) = tokio::fs::rename(&tmp_path, &dest).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(CoreError::Io {
+            context: format!("rename synced output {}", dest.display()),
+            source,
+        });
+    }
     Ok(dest)
 }
 
@@ -518,11 +651,14 @@ where
         }
     }
 
+    let mut frag_buf: Option<Vec<u8>> = None;
+    const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
     loop {
         let mut hdr = [0u8; 2];
         if br.read_exact(&mut hdr).await.is_err() {
             break;
         }
+        let fin = (hdr[0] & 0x80) != 0;
         let opcode = hdr[0] & 0x0f;
         let masked = (hdr[1] & 0x80) != 0;
         let mut len = (hdr[1] & 0x7f) as u64;
@@ -539,7 +675,7 @@ where
             }
             len = u64::from_be_bytes(ext);
         }
-        if len > 16 * 1024 * 1024 {
+        if len > MAX_WS_MESSAGE_BYTES as u64 {
             break;
         }
         let mut mask_key = [0u8; 4];
@@ -561,12 +697,36 @@ where
             // Ping -> send masked Pong
             let _ = writer.write_all(&[0x8A, 0x80, 0, 0, 0, 0]).await;
         } else if opcode == 0x1 {
-            if let Ok(text) = std::str::from_utf8(&payload) {
-                let outs = extract_ws_executed_outputs(text);
-                if !outs.is_empty() {
-                    on_outputs(outs).await;
+            if fin {
+                frag_buf = None;
+                if let Ok(text) = std::str::from_utf8(&payload) {
+                    let outs = extract_ws_executed_outputs(text);
+                    if !outs.is_empty() {
+                        on_outputs(outs).await;
+                    }
+                }
+            } else {
+                frag_buf = Some(payload);
+            }
+        } else if opcode == 0x0 {
+            if let Some(ref mut buf) = frag_buf {
+                if buf.len() + payload.len() > MAX_WS_MESSAGE_BYTES {
+                    break;
+                }
+                buf.extend_from_slice(&payload);
+                if fin {
+                    if let Some(complete) = frag_buf.take() {
+                        if let Ok(text) = std::str::from_utf8(&complete) {
+                            let outs = extract_ws_executed_outputs(text);
+                            if !outs.is_empty() {
+                                on_outputs(outs).await;
+                            }
+                        }
+                    }
                 }
             }
+        } else if opcode == 0x2 && !fin {
+            frag_buf = None;
         }
     }
     Ok(())
@@ -662,8 +822,84 @@ mod tests {
         assert!(ws_outs[0].is_video);
 
         let mut cursor = crate::config::SyncCursor::default();
-        assert!(!cursor.contains("p-1", "ComfyUI_00001_.png"));
-        cursor.insert("p-1", "ComfyUI_00001_.png");
-        assert!(cursor.contains("p-1", "ComfyUI_00001_.png"));
+        assert!(!cursor.contains("p-1", "", "ComfyUI_00001_.png"));
+        cursor.insert("p-1", "", "ComfyUI_00001_.png");
+        assert!(cursor.contains("p-1", "", "ComfyUI_00001_.png"));
+        assert!(!cursor.contains("p-1", "sub", "ComfyUI_00001_.png"));
+    }
+
+    #[test]
+    fn streaming_png_parser_skips_idat_chunks_via_seek() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(make_png_chunk(b"IHDR", &[0u8; 13]));
+        png.extend(make_png_chunk(b"IDAT", &vec![0xAAu8; 2048]));
+        let mut text_prompt = b"prompt\0".to_vec();
+        text_prompt.extend_from_slice(
+            br#"{"6":{"class_type":"CLIPTextEncode","inputs":{"text":"seeked past idat"}}}"#,
+        );
+        png.extend(make_png_chunk(b"tEXt", &text_prompt));
+        png.extend(make_png_chunk(b"IEND", &[]));
+
+        let meta =
+            parse_png_comfy_metadata_reader(Cursor::new(png)).expect("should seek past IDAT");
+        assert_eq!(meta.positive_prompt.as_deref(), Some("seeked past idat"));
+    }
+
+    #[test]
+    fn http_parser_enforces_content_length_and_decodes_chunked() {
+        let truncated = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello";
+        assert!(parse_http_response(truncated).is_err());
+
+        let exact = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        assert_eq!(parse_http_response(exact).unwrap(), b"hello");
+
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(parse_http_response(chunked).unwrap(), b"hello world");
+
+        let chunked_trunc = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+        assert!(parse_http_response(chunked_trunc).is_err());
+    }
+
+    #[test]
+    fn ws_reader_assembles_fragmented_text_frames() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut collected = Vec::new();
+            let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port2 = listener2.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut sock, _) = listener2.accept().await.unwrap();
+                let mut req_buf = [0u8; 1024];
+                let _ = sock.read(&mut req_buf).await;
+                let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                let msg = br#"{"type":"executed","data":{"prompt_id":"p-frag","output":{"images":[{"filename":"frag.png","subfolder":"","type":"output"}]}}}"#;
+                let mid = msg.len() / 2;
+                let mut f1 = vec![0x01u8, mid as u8];
+                f1.extend_from_slice(&msg[..mid]);
+                sock.write_all(&f1).await.unwrap();
+                let rem = msg.len() - mid;
+                let mut f2 = vec![0x80u8, rem as u8];
+                f2.extend_from_slice(&msg[mid..]);
+                sock.write_all(&f2).await.unwrap();
+                sock.write_all(&[0x88u8, 0x00]).await.unwrap();
+            });
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cap_clone = captured.clone();
+            read_ws_executed_once(port2, move |outs| {
+                let c = cap_clone.clone();
+                async move {
+                    c.lock().unwrap().extend(outs);
+                }
+            })
+            .await
+            .unwrap();
+            collected.extend(captured.lock().unwrap().clone());
+            assert_eq!(collected.len(), 1);
+            assert_eq!(collected[0].filename, "frag.png");
+        });
     }
 }

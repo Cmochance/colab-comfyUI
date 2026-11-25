@@ -153,13 +153,13 @@ pub struct SyncCursor {
 }
 
 impl SyncCursor {
-    pub fn contains(&self, prompt_id: &str, filename: &str) -> bool {
-        let key = format!("{prompt_id}:{filename}");
+    pub fn contains(&self, prompt_id: &str, subfolder: &str, filename: &str) -> bool {
+        let key = format!("{prompt_id}:{subfolder}:{filename}");
         self.synced_keys.iter().any(|k| k == &key)
     }
 
-    pub fn insert(&mut self, prompt_id: &str, filename: &str) {
-        let key = format!("{prompt_id}:{filename}");
+    pub fn insert(&mut self, prompt_id: &str, subfolder: &str, filename: &str) {
+        let key = format!("{prompt_id}:{subfolder}:{filename}");
         if self.synced_keys.iter().any(|k| k == &key) {
             return;
         }

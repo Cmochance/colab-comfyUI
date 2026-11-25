@@ -222,7 +222,34 @@ pub fn redact_sensitive_text(input: &str) -> String {
     s = redact_colab_urls(&s);
     s = redact_m_s_endpoints(&s);
     s = redact_url_userinfo(&s);
+    s = redact_hf_tokens(&s);
     s
+}
+
+fn redact_hf_tokens(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 19 <= bytes.len() && &bytes[i..i + 3] == b"hf_" {
+            let boundary_before = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if boundary_before {
+                let mut end = i + 3;
+                while end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
+                    end += 1;
+                }
+                if end - (i + 3) >= 16 {
+                    out.push_str("[REDACTED]");
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn redact_url_userinfo(input: &str) -> String {
@@ -489,7 +516,8 @@ mod tests {
             "Authorization: Bearer ya29.a0AfH6SM_secret\n",
             "x-goog-colab-token: rt_secret_456\n",
             "https://oauth2.googleapis.com/tokeninfo?access_token=ya29.secret_qs\n",
-            "https://oauth2:ghp_secret_token_999@github.com/example/node.git"
+            "https://oauth2:ghp_secret_token_999@github.com/example/node.git\n",
+            "auth failed for hf_AbCdEfGhIjKlMnOpQrStUvWxYz123456"
         );
 
         let redacted = redact_sensitive_text(sample);
@@ -501,6 +529,7 @@ mod tests {
             "ya29.secret_qs",
             "us-central1.colab.googleusercontent.com",
             "ghp_secret_token_999",
+            "hf_AbCdEfGhIjKlMnOpQrStUvWxYz123456",
         ] {
             assert!(
                 !redacted.contains(secret),

@@ -98,6 +98,7 @@ async fn get_snapshot(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, 
 
 #[tauri::command]
 async fn reconcile_startup(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    let _ = state.manager.refresh_hf_token_status().await;
     Ok(state.manager.reconcile_on_startup().await)
 }
 
@@ -470,6 +471,19 @@ async fn apply_preset_workflow(
 }
 
 #[tauri::command]
+async fn send_workflow_to_canvas(
+    state: tauri::State<'_, AppState>,
+    filename: String,
+    workflow_json: String,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .send_workflow_to_canvas(filename, workflow_json)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
 async fn sync_outputs_now(state: tauri::State<'_, AppState>) -> Result<usize, UiError> {
     state
         .manager
@@ -622,6 +636,7 @@ pub fn run() {
             download_catalog_preset,
             download_custom_hf_model,
             apply_preset_workflow,
+            send_workflow_to_canvas,
             sync_outputs_now,
             stop_and_exit,
             leave_running_and_exit,

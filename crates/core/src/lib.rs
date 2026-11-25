@@ -67,7 +67,8 @@ use crate::ssh_tunnel::{
 };
 use crate::sync::{
     default_images_dir, default_videos_dir, download_output_to_local_dir, extract_history_outputs,
-    list_gallery_items, read_ws_executed_once, reveal_in_finder, GalleryItem,
+    fetch_local_comfy_json_long, list_gallery_items, read_ws_executed_once, reveal_in_finder,
+    GalleryItem,
 };
 use crate::telemetry::{
     estimated_remaining_minutes, fetch_local_comfy_json, fetch_remote_probe, parse_comfy_queue,
@@ -486,6 +487,8 @@ pub struct SessionManager {
     watchdog_stop_notify: Arc<Notify>,
     account_switch_in_flight: Arc<AtomicBool>,
     low_balance_notified: Arc<AtomicBool>,
+    download_in_flight: Arc<AtomicBool>,
+    sync_mutex: Arc<Mutex<()>>,
 }
 
 impl SessionManager {
@@ -621,6 +624,8 @@ impl SessionManager {
             watchdog_stop_notify: Arc::new(Notify::new()),
             account_switch_in_flight: Arc::new(AtomicBool::new(false)),
             low_balance_notified: Arc::new(AtomicBool::new(false)),
+            download_in_flight: Arc::new(AtomicBool::new(false)),
+            sync_mutex: Arc::new(Mutex::new(())),
         }
     }
 
@@ -872,7 +877,9 @@ impl SessionManager {
         let queue_idle = match override_queue_idle {
             Some(v) => v,
             None => {
-                if self.local_proxy_port != 0 {
+                if self.download_in_flight.load(Ordering::SeqCst) {
+                    Some(false)
+                } else if self.local_proxy_port != 0 {
                     match fetch_local_comfy_json(self.local_proxy_port, "/queue").await {
                         Ok(body) => parse_comfy_queue(&body).ok().map(|(r, p)| r == 0 && p == 0),
                         Err(_) => None,
@@ -1175,7 +1182,9 @@ impl SessionManager {
             let guard = self.state.lock().await;
             self.effective_sync_dirs(&guard.config)
         };
-        let items = list_gallery_items(&img_dir, &vid_dir);
+        let items = tokio::task::spawn_blocking(move || list_gallery_items(&img_dir, &vid_dir))
+            .await
+            .unwrap_or_default();
         {
             let mut guard = self.state.lock().await;
             guard.gallery_items = items;
@@ -1185,7 +1194,29 @@ impl SessionManager {
     }
 
     pub async fn reveal_gallery_item(&self, path: String) -> Result<(), CoreError> {
-        reveal_in_finder(Path::new(&path), self.runner.as_ref()).await
+        let (img_dir, vid_dir) = {
+            let guard = self.state.lock().await;
+            self.effective_sync_dirs(&guard.config)
+        };
+        let target = std::fs::canonicalize(Path::new(&path)).map_err(|source| CoreError::Io {
+            context: "canonicalize gallery item".to_string(),
+            source,
+        })?;
+        if !target.is_file() {
+            return Err(CoreError::InvalidInput {
+                detail: "画廊目标不是有效文件".to_string(),
+            });
+        }
+        let allowed = [img_dir, vid_dir]
+            .into_iter()
+            .filter_map(|d| std::fs::canonicalize(d).ok())
+            .any(|dir| target.starts_with(&dir));
+        if !allowed {
+            return Err(CoreError::InvalidInput {
+                detail: "仅允许在本地成品同步目录内打开文件".to_string(),
+            });
+        }
+        reveal_in_finder(&target, self.runner.as_ref()).await
     }
 
     pub async fn download_catalog_preset(
@@ -1226,6 +1257,23 @@ impl SessionManager {
         files: Vec<CatalogModelFile>,
         storage: DownloadTargetStorage,
     ) -> Result<AppSnapshot, CoreError> {
+        if self
+            .download_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(CoreError::InvalidInput {
+                detail: "已有模型下载任务正在进行中，请等待完成".to_string(),
+            });
+        }
+        struct DownloadInFlightGuard(Arc<AtomicBool>);
+        impl Drop for DownloadInFlightGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _dl_guard = DownloadInFlightGuard(self.download_in_flight.clone());
+
         let ctl_sock = {
             let h = self.handles.lock().await;
             h.ctl_sock.clone()
@@ -1235,15 +1283,24 @@ impl SessionManager {
         })?;
 
         let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
-        {
+        let (mut content_free, mut drive_free) = {
             let guard = self.state.lock().await;
-            check_disk_quota(
-                total_bytes,
-                storage,
+            (
                 guard.telemetry.content_free_bytes,
                 guard.telemetry.drive_free_bytes,
-            )?;
+            )
+        };
+        let needs_probe = match storage {
+            DownloadTargetStorage::VmContent => content_free.is_none(),
+            DownloadTargetStorage::Drive => drive_free.is_none(),
+        };
+        if needs_probe {
+            if let Ok(remote) = fetch_remote_probe(&ctl_sock, self.runner.as_ref()).await {
+                content_free = remote.content_free_bytes.or(content_free);
+                drive_free = remote.drive_free_bytes.or(drive_free);
+            }
         }
+        check_disk_quota(total_bytes, storage, content_free, drive_free)?;
 
         let hf_token = get_hf_token(self.runner.as_ref()).await.unwrap_or(None);
         let total_files = files.len();
@@ -1269,13 +1326,28 @@ impl SessionManager {
         let logs_ref = self.logs.clone();
         let data_dir_ref = self.data_dir.clone();
         let preset_clone = preset_id.clone();
+        let file_idx_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cb: LineCallback = Arc::new(move |line: String| {
             let redacted = redact_sensitive_text(&line);
             if let Some(fname) = redacted.strip_prefix("MODEL_FILE_START=") {
+                let idx = file_idx_counter.fetch_add(1, Ordering::SeqCst) + 1;
                 if let Ok(mut guard) = state_ref.try_lock() {
                     if let Some(ref mut p) = guard.download_progress {
+                        p.file_index = idx.min(p.total_files.max(1));
                         p.current_file = fname.trim().to_string();
                         p.percent = 0;
+                        p.status = "downloading".to_string();
+                    }
+                }
+                bump_snapshot(&snapshot_tx);
+            } else if let Some(fname) = redacted.strip_prefix("MODEL_SKIPPED=") {
+                let idx = file_idx_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Ok(mut guard) = state_ref.try_lock() {
+                    if let Some(ref mut p) = guard.download_progress {
+                        p.file_index = idx.min(p.total_files.max(1));
+                        p.current_file = fname.trim().to_string();
+                        p.percent = 100;
+                        p.status = "skipped".to_string();
                     }
                 }
                 bump_snapshot(&snapshot_tx);
@@ -1317,6 +1389,55 @@ impl SessionManager {
         Ok(self.snapshot().await)
     }
 
+    pub async fn send_workflow_to_canvas(
+        &self,
+        filename: String,
+        workflow_json: String,
+    ) -> Result<AppSnapshot, CoreError> {
+        let trimmed = filename.trim();
+        let base = Path::new(trimmed)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("gallery_workflow");
+        let stem = base
+            .strip_suffix(".png")
+            .or_else(|| base.strip_suffix(".PNG"))
+            .or_else(|| base.strip_suffix(".json"))
+            .unwrap_or(base);
+        let safe_name = format!(
+            "{}.json",
+            stem.chars()
+                .map(
+                    |c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                )
+                .collect::<String>()
+        );
+        if workflow_json.trim().is_empty() {
+            return Err(CoreError::InvalidInput {
+                detail: "工作流 JSON 为空，无法发回画布".to_string(),
+            });
+        }
+        let ctl_sock = {
+            let h = self.handles.lock().await;
+            h.ctl_sock.clone()
+        }
+        .ok_or_else(|| CoreError::TunnelFailed {
+            detail: "当前没有已连接的 SSH 隧道，无法写入工作流".to_string(),
+        })?;
+        upload_workflow_to_remote(&ctl_sock, &safe_name, &workflow_json, self.runner.as_ref())
+            .await?;
+        self.push_log(format!(
+            "已将画廊工作流 {safe_name} 写入远端 ComfyUI workflows/ 目录。"
+        ))
+        .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
     pub async fn apply_preset_workflow(&self, preset_id: String) -> Result<AppSnapshot, CoreError> {
         let (wf_name, wf_json) = {
             let guard = self.state.lock().await;
@@ -1353,6 +1474,7 @@ impl SessionManager {
     }
 
     pub async fn sync_outputs_now(&self) -> Result<usize, CoreError> {
+        let _sync_guard = self.sync_mutex.lock().await;
         let (local_port, cfg) = {
             let guard = self.state.lock().await;
             if !guard.tunnel_connected {
@@ -1363,7 +1485,9 @@ impl SessionManager {
         if local_port == 0 {
             return Ok(0);
         }
-        let body = fetch_local_comfy_json(local_port, "/history").await?;
+        let body = fetch_local_comfy_json_long(local_port, "/history")
+            .await
+            .map_err(|detail| CoreError::TunnelFailed { detail })?;
         let outputs = extract_history_outputs(&body);
         let (img_dir, vid_dir) = self.effective_sync_dirs(&cfg);
         let cursor_path = sync_cursor_path(&self.data_dir);
@@ -1373,20 +1497,22 @@ impl SessionManager {
             .unwrap_or_default();
         let mut added = 0usize;
         for out_ref in outputs {
-            if cursor.contains(&out_ref.prompt_id, &out_ref.filename) {
+            if cursor.contains(&out_ref.prompt_id, &out_ref.subfolder, &out_ref.filename) {
                 continue;
             }
             if download_output_to_local_dir(local_port, &out_ref, &img_dir, &vid_dir)
                 .await
                 .is_ok()
             {
-                cursor.insert(&out_ref.prompt_id, &out_ref.filename);
+                cursor.insert(&out_ref.prompt_id, &out_ref.subfolder, &out_ref.filename);
                 added += 1;
             }
         }
         if added > 0 {
             let _ = save_json_0600(&cursor_path, &cursor);
-            let items = list_gallery_items(&img_dir, &vid_dir);
+            let items = tokio::task::spawn_blocking(move || list_gallery_items(&img_dir, &vid_dir))
+                .await
+                .unwrap_or_default();
             let mut guard = self.state.lock().await;
             guard.synced_count += added;
             guard.gallery_items = items;
@@ -1486,6 +1612,15 @@ impl SessionManager {
             .ok_or_else(|| CoreError::MissingBinary {
                 name: "colab".to_string(),
             })
+    }
+
+    pub async fn refresh_hf_token_status(&self) -> bool {
+        let configured = has_hf_token(self.runner.as_ref()).await;
+        {
+            let mut guard = self.state.lock().await;
+            guard.hf_token_configured = configured;
+        }
+        configured
     }
 
     /// Reconciles `pending-session.json` and `active-session.json` against Colab on startup.
@@ -2844,6 +2979,7 @@ impl SessionManager {
         let intentional_stop = self.intentional_stop.clone();
         let snapshot_tx = self.snapshot_tx.clone();
         let handles_ref = self.handles.clone();
+        let sync_mutex = self.sync_mutex.clone();
 
         let task = tokio::spawn(async move {
             loop {
@@ -2871,7 +3007,8 @@ impl SessionManager {
                 let cursor_path = sync_cursor_path(&data_dir);
 
                 // Catch up via /history on connect/reconnect
-                if let Ok(body) = fetch_local_comfy_json(local_port, "/history").await {
+                if let Ok(body) = fetch_local_comfy_json_long(local_port, "/history").await {
+                    let _sync_guard = sync_mutex.lock().await;
                     let outputs = extract_history_outputs(&body);
                     let mut cursor: SyncCursor = load_json_opt(&cursor_path)
                         .ok()
@@ -2879,20 +3016,33 @@ impl SessionManager {
                         .unwrap_or_default();
                     let mut added = 0usize;
                     for out_ref in outputs {
-                        if cursor.contains(&out_ref.prompt_id, &out_ref.filename) {
+                        if cursor.contains(
+                            &out_ref.prompt_id,
+                            &out_ref.subfolder,
+                            &out_ref.filename,
+                        ) {
                             continue;
                         }
                         if download_output_to_local_dir(local_port, &out_ref, &img_dir, &vid_dir)
                             .await
                             .is_ok()
                         {
-                            cursor.insert(&out_ref.prompt_id, &out_ref.filename);
+                            cursor.insert(
+                                &out_ref.prompt_id,
+                                &out_ref.subfolder,
+                                &out_ref.filename,
+                            );
                             added += 1;
                         }
                     }
                     if added > 0 {
                         let _ = save_json_0600(&cursor_path, &cursor);
-                        let items = list_gallery_items(&img_dir, &vid_dir);
+                        let img_c = img_dir.clone();
+                        let vid_c = vid_dir.clone();
+                        let items =
+                            tokio::task::spawn_blocking(move || list_gallery_items(&img_c, &vid_c))
+                                .await
+                                .unwrap_or_default();
                         let mut guard = state.lock().await;
                         guard.synced_count += added;
                         guard.gallery_items = items;
@@ -2907,14 +3057,20 @@ impl SessionManager {
                     let cursor_path = cursor_path.clone();
                     let state = state.clone();
                     let snapshot_tx = snapshot_tx.clone();
+                    let sync_mutex = sync_mutex.clone();
                     async move {
+                        let _sync_guard = sync_mutex.lock().await;
                         let mut cursor: SyncCursor = load_json_opt(&cursor_path)
                             .ok()
                             .flatten()
                             .unwrap_or_default();
                         let mut added = 0usize;
                         for out_ref in outs {
-                            if cursor.contains(&out_ref.prompt_id, &out_ref.filename) {
+                            if cursor.contains(
+                                &out_ref.prompt_id,
+                                &out_ref.subfolder,
+                                &out_ref.filename,
+                            ) {
                                 continue;
                             }
                             if download_output_to_local_dir(
@@ -2923,13 +3079,21 @@ impl SessionManager {
                             .await
                             .is_ok()
                             {
-                                cursor.insert(&out_ref.prompt_id, &out_ref.filename);
+                                cursor.insert(
+                                    &out_ref.prompt_id,
+                                    &out_ref.subfolder,
+                                    &out_ref.filename,
+                                );
                                 added += 1;
                             }
                         }
                         if added > 0 {
                             let _ = save_json_0600(&cursor_path, &cursor);
-                            let items = list_gallery_items(&img_dir, &vid_dir);
+                            let items = tokio::task::spawn_blocking(move || {
+                                list_gallery_items(&img_dir, &vid_dir)
+                            })
+                            .await
+                            .unwrap_or_default();
                             let mut guard = state.lock().await;
                             guard.synced_count += added;
                             guard.gallery_items = items;
@@ -3249,6 +3413,7 @@ impl SessionManager {
         let logs_ref = self.logs.clone();
         let data_dir_ref = self.data_dir.clone();
         let low_balance_notified = self.low_balance_notified.clone();
+        let download_in_flight = self.download_in_flight.clone();
 
         {
             let now_mono = clock.now_monotonic();
@@ -3306,6 +3471,9 @@ impl SessionManager {
                             fresh_queue_idle = Some(running == 0 && pending == 0);
                         }
                     }
+                }
+                if download_in_flight.load(Ordering::SeqCst) {
+                    fresh_queue_idle = Some(false);
                 }
 
                 // Tier 2 (every ~21s): single probe over existing ControlMaster socket (zero extra SSH)
@@ -3645,10 +3813,12 @@ impl SessionManager {
             wd.snapshot(now_mono)
         };
         self.low_balance_notified.store(false, Ordering::SeqCst);
+        self.download_in_flight.store(false, Ordering::SeqCst);
         let mut guard = self.state.lock().await;
         guard.tunnel_connected = false;
         guard.watchdog = wd_snap;
         guard.low_balance_warning = false;
+        guard.download_progress = None;
     }
 
     /// Stops the active (or pending) Colab session and runs triple verification.
