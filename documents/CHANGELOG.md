@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0（未发布 / unreleased）
+
+### 简体中文
+
+- 新增按需远端视觉 Sidecar 与看图反推提示词（`llm_sidecar.rs`）：钉死 `llama.cpp` `b12722` CUDA 12.8 预编译包与 `sha256` 校验，启动前通过主 `ControlMaster` 探针核验 VM NVIDIA 驱动与 `glibc` 版本；通过 `ssh -S <ctl> -O forward` 复用主隧道建 `run/llm.sock`（绝不新增 `colab ssh`）；`G4`/`H100`/`A100` 支持与 ComfyUI 显存共驻，`L4`/`T4` 紧凑显存自动调用 ComfyUI `POST /free` 释放缓存；支持直接对本地图片或画廊成品反推 FLUX / ComfyUI Tags / Wan 2.2 Motion 提示词。
+- 新增固定端口本地鉴权透传 API 网关（`gateway.rs`）：固定监听 `127.0.0.1:18080`（严禁 `0.0.0.0`），透明反向代理至 `llm.sock`，直接透传 `llama-server` 原生 Anthropic `/v1/messages`、`/v1/messages/count_tokens` 与 OpenAI `/v1/chat/completions`、`/v1/models`（含 SSE 流式）；强制校验 `Bearer` / `x-api-key` 密钥（存 macOS 钥匙串 `gateway_api_key`，不在 `~/.colab-comfyui/` 落盘）与 `Host`/`Origin`，并提供一键复制 Claude Code / Cursor 配置（注明小参数视觉模型主打看图反推）。
+
+### English
+
+- Added on-demand remote vision sidecar & image-to-prompt interrogation (`llm_sidecar.rs`): pins `llama.cpp` `b12722` CUDA 12.8 prebuilt binary + `sha256`, probes VM NVIDIA driver and `glibc` versions before launch, reuses the main `ControlMaster` via `ssh -S <ctl> -O forward` to `run/llm.sock` (no extra `colab ssh`), supports VRAM coexistence on `G4`/`H100`/`A100` and automatic ComfyUI `POST /free` eviction on `L4`/`T4`, and generates FLUX / ComfyUI Tags / Wan 2.2 Motion prompts from local or gallery images.
+- Added fixed-port authenticated local API gateway (`gateway.rs`): binds strictly to `127.0.0.1:18080` and transparently proxies to `llm.sock` using `llama-server`'s native Anthropic `/v1/messages` & `/v1/messages/count_tokens` and OpenAI `/v1/chat/completions` & `/v1/models` (including SSE streaming); enforces keychain-backed `Bearer` / `x-api-key` auth (`gateway_api_key`) and `Host`/`Origin` validation, with one-click Claude Code / Cursor snippet copy.
+
 ## 0.5.0（未发布 / unreleased）
 
 ### 简体中文

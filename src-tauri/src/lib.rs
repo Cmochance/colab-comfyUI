@@ -493,6 +493,78 @@ async fn sync_outputs_now(state: tauri::State<'_, AppState>) -> Result<usize, Ui
 }
 
 #[tauri::command]
+async fn start_llm_sidecar(
+    state: tauri::State<'_, AppState>,
+    model_id: String,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .start_llm_sidecar(model_id)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn stop_llm_sidecar(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .stop_llm_sidecar()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn interrogate_image(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    style: colab_comfy_core::llm_sidecar::InterrogateStyle,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .interrogate_image(path, style)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn start_api_gateway(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .start_api_gateway()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn stop_api_gateway(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .stop_api_gateway()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn rotate_gateway_key(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .rotate_gateway_key()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn get_gateway_client_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<colab_comfy_core::GatewayClientConfig, UiError> {
+    state
+        .manager
+        .get_gateway_client_config()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
 async fn stop_and_exit(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -638,6 +710,13 @@ pub fn run() {
             apply_preset_workflow,
             send_workflow_to_canvas,
             sync_outputs_now,
+            start_llm_sidecar,
+            stop_llm_sidecar,
+            interrogate_image,
+            start_api_gateway,
+            stop_api_gateway,
+            rotate_gateway_key,
+            get_gateway_client_config,
             stop_and_exit,
             leave_running_and_exit,
         ])

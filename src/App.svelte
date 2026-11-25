@@ -183,6 +183,24 @@
     metadata: PngComfyMetadata | null;
   }
 
+  type InterrogateStyle = 'FluxNatural' | 'ComfyTags' | 'WanVideoMotion';
+
+  interface SidecarModelPreset {
+    id: string;
+    name: string;
+    description_zh: string;
+    description_en: string;
+    min_vram_gb: number;
+    total_bytes: number;
+  }
+
+  interface GatewayClientConfig {
+    base_url: string;
+    api_key: string;
+    model_alias: string;
+    claude_code_env: string;
+  }
+
   interface AppSnapshot {
     phase: SessionPhase;
     step: StartStep | null;
@@ -225,6 +243,14 @@
     download_progress: DownloadProgress | null;
     synced_count: number;
     gallery_items: GalleryItem[];
+    sidecar_models: SidecarModelPreset[];
+    sidecar_running: boolean;
+    sidecar_model_id: string | null;
+    sidecar_compact_vram: boolean;
+    gateway_running: boolean;
+    gateway_port: number;
+    gateway_key_configured: boolean;
+    last_interrogated_prompt: string | null;
     logs: string[];
     i18n: Record<string, string>;
   }
@@ -273,6 +299,12 @@
   let syncVideosDir = $state('');
   let selectedGalleryItem = $state<GalleryItem | null>(null);
   let copiedHint = $state(false);
+  let sidecarBusy = $state(false);
+  let selectedSidecarModel = $state('qwen2.5-vl-3b-q4');
+  let interrogatePath = $state('');
+  let interrogateStyle = $state<InterrogateStyle>('FluxNatural');
+  let gatewayBusy = $state(false);
+  let gatewayCopyHint = $state(false);
   let logsExpanded = $state(false);
   let showZeroCuModal = $state(false);
   let showExitModal = $state(false);
@@ -821,6 +853,89 @@
   async function runRevealGalleryItem(path: string) {
     try {
       await invoke('reveal_gallery_item', { path });
+    } catch (err) {
+      actionError = err as UiError;
+    }
+  }
+
+  async function runStartSidecar() {
+    sidecarBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>('start_llm_sidecar', { modelId: selectedSidecarModel });
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      sidecarBusy = false;
+    }
+  }
+
+  async function runStopSidecar() {
+    sidecarBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>('stop_llm_sidecar');
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      sidecarBusy = false;
+    }
+  }
+
+  async function runInterrogate(pathOverride: string = '') {
+    const target = (pathOverride || interrogatePath).trim();
+    if (!target) return;
+    interrogatePath = target;
+    sidecarBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>('interrogate_image', {
+        path: target,
+        style: interrogateStyle
+      });
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      sidecarBusy = false;
+    }
+  }
+
+  async function runToggleGateway() {
+    gatewayBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>(
+        snap?.gateway_running ? 'stop_api_gateway' : 'start_api_gateway'
+      );
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      gatewayBusy = false;
+    }
+  }
+
+  async function runRotateGatewayKey() {
+    gatewayBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>('rotate_gateway_key');
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      gatewayBusy = false;
+    }
+  }
+
+  async function runCopyGatewaySnippet(kind: 'claude' | 'cursor') {
+    try {
+      const cfg = await invoke<GatewayClientConfig>('get_gateway_client_config');
+      const text =
+        kind === 'claude'
+          ? cfg.claude_code_env
+          : `Base URL: ${cfg.base_url}/v1\nAPI Key: ${cfg.api_key}\nModel: ${cfg.model_alias}`;
+      await navigator.clipboard.writeText(text);
+      gatewayCopyHint = true;
+      setTimeout(() => (gatewayCopyHint = false), 2000);
     } catch (err) {
       actionError = err as UiError;
     }
@@ -1382,6 +1497,15 @@
               <button class="secondary" onclick={() => runRevealGalleryItem(item.path)}>
                 {t('gallery_reveal_btn', '在 Finder 显示')}
               </button>
+              {#if !item.is_video && snap?.sidecar_running}
+                <button
+                  class="secondary"
+                  disabled={sidecarBusy}
+                  onclick={() => runInterrogate(item.path)}
+                >
+                  {t('interrogate_btn', '反推提示词')}
+                </button>
+              {/if}
             </div>
           </div>
         {/each}
@@ -1429,6 +1553,84 @@
     {:else}
       <p class="hint">{t('gallery_empty', '暂无已同步成品')}</p>
     {/if}
+  </section>
+
+  <section class="card">
+    <div class="row-between">
+      <h2>{t('vision_gateway_title', '视觉反推提示词 & 本地双协议 API 网关')}</h2>
+      {#if snap?.sidecar_running}
+        <span class="badge ok">{t('sidecar_running_badge', 'Sidecar 运行中')} ({snap.sidecar_model_id})</span>
+      {/if}
+    </div>
+    <p class="hint">{t('vision_gateway_subtitle', '按需拉起预编译 CUDA llama-server（复用主 SSH 隧道）')}</p>
+    <div class="controls">
+      <select bind:value={selectedSidecarModel} disabled={sidecarBusy || snap?.sidecar_running}>
+        {#each snap?.sidecar_models ?? [] as m}
+          <option value={m.id}>{m.name} ({formatGiB(m.total_bytes)}, {m.min_vram_gb}GB+ VRAM)</option>
+        {/each}
+      </select>
+      {#if snap?.sidecar_running}
+        <button class="secondary" disabled={sidecarBusy} onclick={runStopSidecar}>
+          {t('sidecar_stop_btn', '停止并释放显存')}
+        </button>
+      {:else}
+        <button class="primary" disabled={!snap?.tunnel_connected || sidecarBusy} onclick={runStartSidecar}>
+          {t('sidecar_start_btn', '启动视觉 Sidecar')}
+        </button>
+      {/if}
+    </div>
+    {#if snap?.sidecar_running && snap?.sidecar_compact_vram}
+      <p class="hint">{t('sidecar_compact_vram_hint', '紧凑显存模式（T4/L4）：启动前已自动调用 ComfyUI /free 释放缓存')}</p>
+    {/if}
+    <div class="controls" style="margin-top: 0.5rem;">
+      <input
+        type="text"
+        placeholder={t('interrogate_image_path_placeholder', '输入本地图片路径')}
+        bind:value={interrogatePath}
+        disabled={sidecarBusy}
+      />
+      <select bind:value={interrogateStyle} disabled={sidecarBusy}>
+        <option value="FluxNatural">FLUX Natural</option>
+        <option value="ComfyTags">ComfyUI Tags</option>
+        <option value="WanVideoMotion">Wan 2.2 Motion</option>
+      </select>
+      <button
+        class="secondary"
+        disabled={!snap?.sidecar_running || sidecarBusy || !interrogatePath.trim()}
+        onclick={() => runInterrogate()}
+      >
+        {t('interrogate_btn', '反推提示词')}
+      </button>
+    </div>
+    {#if snap?.last_interrogated_prompt}
+      <div class="banner info" style="margin-top: 0.5rem;">
+        <p class="sensitive" style="user-select: text;">{snap.last_interrogated_prompt}</p>
+        <button class="secondary" onclick={() => runCopyPrompt(snap?.last_interrogated_prompt ?? '')}>
+          {copiedHint ? t('gallery_copied_notice', '已复制到剪贴板') : t('gallery_copy_prompt_btn', '复制 Prompt')}
+        </button>
+      </div>
+    {/if}
+    <div class="controls" style="margin-top: 0.75rem;">
+      <button
+        class="secondary"
+        disabled={!snap?.sidecar_running || gatewayBusy}
+        onclick={runToggleGateway}
+      >
+        {snap?.gateway_running
+          ? t('gateway_stop_btn', '关闭本地网关')
+          : t('gateway_start_btn', '开启本地网关 (18080)')}
+      </button>
+      <button class="secondary" disabled={gatewayBusy} onclick={runRotateGatewayKey}>
+        {t('gateway_rotate_key_btn', '轮换密钥')}
+      </button>
+      <button class="secondary" disabled={gatewayBusy} onclick={() => runCopyGatewaySnippet('claude')}>
+        {gatewayCopyHint ? t('gallery_copied_notice', '已复制到剪贴板') : t('gateway_copy_claude_btn', '复制 Claude Code 命令')}
+      </button>
+      <button class="secondary" disabled={gatewayBusy} onclick={() => runCopyGatewaySnippet('cursor')}>
+        {t('gateway_copy_cursor_btn', '复制 Cursor 地址与密钥')}
+      </button>
+    </div>
+    <p class="hint">{t('gateway_disclaimer', '提示：本地网关主打看图反推与轻量对话，小参数视觉模型不承诺稳定驱动 Claude Code 复杂工具调用流。')}</p>
   </section>
 
   {#if snap?.last_export_report}

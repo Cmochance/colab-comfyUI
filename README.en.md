@@ -17,9 +17,10 @@
 
 ## Current state
 
-Usable (**v0.5.0 Phase 4**):
+Usable (**v0.6.0 Phase 5**):
 
 - One-click launch: supports `L4` (`High-RAM` disabled), `T4`, `G4`, `A100`, and `H100`, with preflight `colab` auth and compute-unit balance checks (confirm prompt on 0 CU)
+- Vision Interrogation & Fixed-Port Local API Gateway: on-demand prebuilt `b12722` CUDA `llama-server` (`sha256`-verified, driver/`glibc` probed, `L4`/`T4` auto-eviction via ComfyUI `/free`) forwarded over main `ControlMaster` to `llm.sock`; supports image-to-prompt interrogation (FLUX / Tags / Wan 2.2) and a keychain-authenticated `127.0.0.1:18080` passthrough gateway for native `/v1/messages` & `/v1/chat/completions`
 - Verified Model/Workflow Catalog & `HF_TOKEN` Keychain: ships verified presets (`FLUX.1-dev FP8`, `FLUX.1-schnell FP8`, `Wan 2.2 TI2V 5B`) plus custom Hugging Face URL/repo import, dual-disk 2 GiB quota checks, `/content`-first download before atomic Drive copy, and stdin-fed `aria2c` injection for `HF_TOKEN`
 - Auto Output Sync & PNG Metadata Gallery: syncs images/videos via `/ws` (`executed`) and `/history` cursor deduplication, and extracts PNG `tEXt`/`iTXt` prompt & workflow metadata with prompt copy and Finder reveal
 - `agy-cs` multi-account integration & drift guard: detects local `agy-cs` and `Agy Switcher.app` (gracefully degrading to single-account mode when absent), displays per-account CU balances, blocks switching while a session is active, and supports one-click switch-back by resolving `owner_email` via `agy-cs colab ls`
@@ -28,10 +29,6 @@ Usable (**v0.5.0 Phase 4**):
 - Live GPU & CU telemetry: 3s local proxy VRAM/RAM/queue polling, 20s `ControlMaster`-reused `nvidia-smi` & disk probe, 60s `colab usage` remaining-time estimate, 120-sample live chart, live Chinese/English switching, and a privacy-mask toggle
 - Zero-exposure local tunnel & dual windows: single-slot SSH `ControlMaster` + Unix socket + `127.0.0.1:18188` `Host`/`Origin`-validated reverse proxy, with zero Tauri IPC permissions on the `canvas` window
 - Billing safeguards: two-phase local session ledger (`~/.colab-comfyui/`), startup reconciliation, three-way exit confirmation, triple-verified stop reports, and a link to manage `[?]` orphan sessions
-
-Planned next:
-
-- On-demand vision prompt helper and fixed-port local API proxy
 
 ## Requirements
 

@@ -3,8 +3,10 @@ pub mod bootstrap;
 pub mod catalog;
 pub mod colab_cli;
 pub mod config;
+pub mod gateway;
 pub mod hf_keychain;
 pub mod i18n;
+pub mod llm_sidecar;
 pub mod local_proxy;
 pub mod locate;
 pub mod persistence;
@@ -44,12 +46,22 @@ use crate::catalog::{
 use crate::colab_cli::{SessionEntry, SessionStatusLookup, StopReport, UsageInfo};
 use crate::config::{
     active_session_path, append_app_log_0600, config_path, ctl_socket_path,
-    default_session_name_for_email, ensure_data_dirs, load_json_opt, pending_session_path,
-    remove_if_exists, save_json_0600, sync_cursor_path, validate_session_name, ActiveSession,
-    AppConfig, GpuTier, PendingSession, StateLock, SyncCursor, LOCAL_PROXY_PORT, REMOTE_COMFY_PORT,
+    default_session_name_for_email, ensure_data_dirs, llm_socket_path, load_json_opt,
+    pending_session_path, remove_if_exists, save_json_0600, sync_cursor_path,
+    validate_session_name, ActiveSession, AppConfig, GpuTier, PendingSession, StateLock,
+    SyncCursor, GATEWAY_PROXY_PORT, LOCAL_PROXY_PORT, REMOTE_COMFY_PORT,
 };
-use crate::hf_keychain::{delete_hf_token, get_hf_token, has_hf_token, set_hf_token};
+use crate::gateway::{start_gateway_proxy, GatewayHandle};
+use crate::hf_keychain::{
+    delete_hf_token, ensure_gateway_api_key, generate_gateway_api_key, get_hf_token,
+    has_gateway_api_key, has_hf_token, set_gateway_api_key, set_hf_token,
+};
 use crate::i18n::{message_table, Locale};
+use crate::llm_sidecar::{
+    builtin_sidecar_models, cancel_llm_socket, forward_llm_socket, free_comfy_vram,
+    interrogate_image_over_socket, is_compact_vram_mode, probe_vm_sidecar_env,
+    start_remote_llama_server, stop_remote_llama_server, InterrogateStyle, SidecarModelPreset,
+};
 use crate::local_proxy::{start_local_proxy, LocalProxyHandle};
 use crate::locate::{check_env, resolve_proxy_envs, EnvReport};
 use crate::persistence::{
@@ -264,6 +276,14 @@ pub struct StartupNotice {
     pub session_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayClientConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model_alias: String,
+    pub claude_code_env: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppSnapshot {
     pub phase: SessionPhase,
@@ -295,6 +315,14 @@ pub struct AppSnapshot {
     pub download_progress: Option<DownloadProgress>,
     pub synced_count: usize,
     pub gallery_items: Vec<GalleryItem>,
+    pub sidecar_models: Vec<SidecarModelPreset>,
+    pub sidecar_running: bool,
+    pub sidecar_model_id: Option<String>,
+    pub sidecar_compact_vram: bool,
+    pub gateway_running: bool,
+    pub gateway_port: u16,
+    pub gateway_key_configured: bool,
+    pub last_interrogated_prompt: Option<String>,
     pub logs: Vec<String>,
     pub i18n: BTreeMap<String, String>,
 }
@@ -309,9 +337,11 @@ enum DriveUserAction {
 #[derive(Default)]
 struct RuntimeHandles {
     proxy: Option<LocalProxyHandle>,
+    gateway: Option<GatewayHandle>,
     tunnel_proc: Option<Box<dyn TunnelProcess>>,
     ctl_sock: Option<PathBuf>,
     comfy_sock: Option<PathBuf>,
+    llm_sock: Option<PathBuf>,
     supervisor_task: Option<JoinHandle<()>>,
     telemetry_task: Option<JoinHandle<()>>,
     sync_task: Option<JoinHandle<()>>,
@@ -346,6 +376,14 @@ struct InnerState {
     download_progress: Option<DownloadProgress>,
     synced_count: usize,
     gallery_items: Vec<GalleryItem>,
+    sidecar_models: Vec<SidecarModelPreset>,
+    sidecar_running: bool,
+    sidecar_model_id: Option<String>,
+    sidecar_compact_vram: bool,
+    gateway_running: bool,
+    gateway_port: u16,
+    gateway_key_configured: bool,
+    last_interrogated_prompt: Option<String>,
     has_managed_session: Arc<AtomicBool>,
 }
 
@@ -489,6 +527,7 @@ pub struct SessionManager {
     low_balance_notified: Arc<AtomicBool>,
     download_in_flight: Arc<AtomicBool>,
     sync_mutex: Arc<Mutex<()>>,
+    sidecar_mutex: Arc<Mutex<()>>,
 }
 
 impl SessionManager {
@@ -577,6 +616,14 @@ impl SessionManager {
             download_progress: None,
             synced_count: 0,
             gallery_items: Vec::new(),
+            sidecar_models: builtin_sidecar_models(),
+            sidecar_running: false,
+            sidecar_model_id: None,
+            sidecar_compact_vram: false,
+            gateway_running: false,
+            gateway_port: GATEWAY_PROXY_PORT,
+            gateway_key_configured: false,
+            last_interrogated_prompt: None,
             has_managed_session: has_managed_session.clone(),
         };
         let initial_gallery = {
@@ -626,6 +673,7 @@ impl SessionManager {
             low_balance_notified: Arc::new(AtomicBool::new(false)),
             download_in_flight: Arc::new(AtomicBool::new(false)),
             sync_mutex: Arc::new(Mutex::new(())),
+            sidecar_mutex: Arc::new(Mutex::new(())),
         }
     }
 
@@ -749,6 +797,14 @@ impl SessionManager {
             download_progress: s.download_progress.clone(),
             synced_count: s.synced_count,
             gallery_items: s.gallery_items.clone(),
+            sidecar_models: s.sidecar_models.clone(),
+            sidecar_running: s.sidecar_running,
+            sidecar_model_id: s.sidecar_model_id.clone(),
+            sidecar_compact_vram: s.sidecar_compact_vram,
+            gateway_running: s.gateway_running,
+            gateway_port: s.gateway_port,
+            gateway_key_configured: s.gateway_key_configured,
+            last_interrogated_prompt: s.last_interrogated_prompt.clone(),
             logs,
             i18n: table,
         }
@@ -1616,11 +1672,265 @@ impl SessionManager {
 
     pub async fn refresh_hf_token_status(&self) -> bool {
         let configured = has_hf_token(self.runner.as_ref()).await;
+        let gw_configured = has_gateway_api_key(self.runner.as_ref()).await;
         {
             let mut guard = self.state.lock().await;
             guard.hf_token_configured = configured;
+            guard.gateway_key_configured = gw_configured;
         }
         configured
+    }
+
+    pub async fn start_llm_sidecar(&self, model_id: String) -> Result<AppSnapshot, CoreError> {
+        let _sidecar_guard = self.sidecar_mutex.lock().await;
+        let preset = builtin_sidecar_models()
+            .into_iter()
+            .find(|m| m.id == model_id)
+            .ok_or_else(|| CoreError::InvalidInput {
+                detail: format!("未找到视觉模型预设：{model_id}"),
+            })?;
+        let ctl_sock = {
+            let h = self.handles.lock().await;
+            h.ctl_sock.clone()
+        }
+        .ok_or_else(|| CoreError::TunnelFailed {
+            detail: "当前没有已连接的 SSH 隧道，无法启动视觉模型 Sidecar".to_string(),
+        })?;
+
+        let (gpu, vram_total) = {
+            let guard = self.state.lock().await;
+            let g = guard
+                .active_session
+                .as_ref()
+                .map(|a| a.gpu)
+                .unwrap_or(guard.config.default_gpu);
+            (g, guard.telemetry.vram_total_bytes)
+        };
+
+        let probe = probe_vm_sidecar_env(&ctl_sock, self.runner.as_ref()).await?;
+        let compact = is_compact_vram_mode(gpu, vram_total);
+        if compact && self.local_proxy_port != 0 {
+            if let Err(err) = free_comfy_vram(self.local_proxy_port).await {
+                self.push_log(format!(
+                    "紧凑显存释放 ComfyUI 缓存失败（继续尝试拉起）：{err}"
+                ))
+                .await;
+            } else {
+                self.push_log("紧凑显存模式：已通知 ComfyUI 释放模型缓存。".to_string())
+                    .await;
+            }
+        }
+
+        let llm_sock = llm_socket_path(&self.data_dir)?;
+        let hf_token = get_hf_token(self.runner.as_ref()).await.unwrap_or(None);
+        let cb = self.make_line_callback();
+        start_remote_llama_server(
+            &ctl_sock,
+            &preset,
+            hf_token.as_deref(),
+            self.runner.as_ref(),
+            Some(cb),
+        )
+        .await?;
+        if let Err(err) = forward_llm_socket(&ctl_sock, &llm_sock, self.runner.as_ref()).await {
+            let _ = stop_remote_llama_server(&ctl_sock, self.runner.as_ref()).await;
+            return Err(err);
+        }
+
+        {
+            let mut h = self.handles.lock().await;
+            h.llm_sock = Some(llm_sock);
+        }
+        {
+            let mut guard = self.state.lock().await;
+            guard.sidecar_running = true;
+            guard.sidecar_model_id = Some(preset.id.clone());
+            guard.sidecar_compact_vram = compact;
+        }
+        self.push_log(format!(
+            "已启动远端 llama-server（{}，驱动 {}，glibc {}）并建立 llm.sock 转发。",
+            preset.id,
+            probe.driver_version.as_deref().unwrap_or("?"),
+            probe
+                .glibc_version
+                .map(|(a, b)| format!("{a}.{b}"))
+                .unwrap_or_else(|| "?".to_string()),
+        ))
+        .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn stop_llm_sidecar(&self) -> Result<AppSnapshot, CoreError> {
+        let _sidecar_guard = self.sidecar_mutex.lock().await;
+        let (gw, llm_sock, ctl_sock) = {
+            let mut h = self.handles.lock().await;
+            (h.gateway.take(), h.llm_sock.take(), h.ctl_sock.clone())
+        };
+        if let Some(g) = gw {
+            g.shutdown().await;
+        }
+        if let (Some(ctl), Some(sock)) = (ctl_sock.as_ref(), llm_sock.as_ref()) {
+            cancel_llm_socket(ctl, sock, self.runner.as_ref()).await;
+        }
+        if let Some(ctl) = ctl_sock {
+            let _ = stop_remote_llama_server(&ctl, self.runner.as_ref()).await;
+        }
+        {
+            let mut guard = self.state.lock().await;
+            guard.gateway_running = false;
+            guard.sidecar_running = false;
+            guard.sidecar_model_id = None;
+        }
+        self.push_log("已停止远端视觉模型 Sidecar 并释放显存。".to_string())
+            .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn interrogate_image(
+        &self,
+        path: String,
+        style: InterrogateStyle,
+    ) -> Result<AppSnapshot, CoreError> {
+        let llm_sock = {
+            let h = self.handles.lock().await;
+            h.llm_sock.clone()
+        }
+        .ok_or_else(|| CoreError::TunnelFailed {
+            detail: "请先启动视觉模型 Sidecar".to_string(),
+        })?;
+        let model_alias = {
+            let guard = self.state.lock().await;
+            if !guard.sidecar_running {
+                return Err(CoreError::InvalidInput {
+                    detail: "请先启动视觉模型 Sidecar".to_string(),
+                });
+            }
+            guard
+                .sidecar_model_id
+                .clone()
+                .unwrap_or_else(|| "qwen2.5-vl-3b-q4".to_string())
+        };
+        let prompt =
+            interrogate_image_over_socket(&llm_sock, Path::new(&path), &model_alias, style).await?;
+        {
+            let mut guard = self.state.lock().await;
+            guard.last_interrogated_prompt = Some(prompt);
+        }
+        self.push_log("已完成看图反推提示词。".to_string()).await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn start_api_gateway(&self) -> Result<AppSnapshot, CoreError> {
+        let llm_sock = {
+            let h = self.handles.lock().await;
+            h.llm_sock.clone()
+        }
+        .ok_or_else(|| CoreError::InvalidInput {
+            detail: "请先启动视觉模型 Sidecar 再开启本地 API 网关".to_string(),
+        })?;
+        {
+            let mut h = self.handles.lock().await;
+            if let Some(old) = h.gateway.take() {
+                old.shutdown().await;
+            }
+        }
+        let key = ensure_gateway_api_key(self.runner.as_ref()).await?;
+        let gw =
+            start_gateway_proxy(GATEWAY_PROXY_PORT, llm_sock, key, self.runner.as_ref()).await?;
+        {
+            let mut h = self.handles.lock().await;
+            h.gateway = Some(gw);
+        }
+        {
+            let mut guard = self.state.lock().await;
+            guard.gateway_running = true;
+            guard.gateway_key_configured = true;
+        }
+        self.push_log(format!(
+            "已启动本地鉴权 API 网关（127.0.0.1:{GATEWAY_PROXY_PORT}，原生 /v1/messages & /v1/chat/completions）。"
+        ))
+        .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn stop_api_gateway(&self) -> Result<AppSnapshot, CoreError> {
+        let gw = {
+            let mut h = self.handles.lock().await;
+            h.gateway.take()
+        };
+        if let Some(g) = gw {
+            g.shutdown().await;
+        }
+        {
+            let mut guard = self.state.lock().await;
+            guard.gateway_running = false;
+        }
+        self.push_log("已关闭本地 API 网关。".to_string()).await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn rotate_gateway_key(&self) -> Result<AppSnapshot, CoreError> {
+        let new_key = generate_gateway_api_key()?;
+        set_gateway_api_key(&new_key, self.runner.as_ref()).await?;
+        let was_running = {
+            let guard = self.state.lock().await;
+            guard.gateway_running
+        };
+        if was_running {
+            let llm_sock = {
+                let mut h = self.handles.lock().await;
+                if let Some(old) = h.gateway.take() {
+                    old.shutdown().await;
+                }
+                h.llm_sock.clone()
+            };
+            if let Some(sock) = llm_sock {
+                let gw =
+                    start_gateway_proxy(GATEWAY_PROXY_PORT, sock, new_key, self.runner.as_ref())
+                        .await?;
+                let mut h = self.handles.lock().await;
+                h.gateway = Some(gw);
+            }
+        }
+        {
+            let mut guard = self.state.lock().await;
+            guard.gateway_key_configured = true;
+        }
+        self.push_log("已轮换本地 API 网关密钥（macOS 钥匙串）。".to_string())
+            .await;
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn get_gateway_client_config(&self) -> Result<GatewayClientConfig, CoreError> {
+        let key = ensure_gateway_api_key(self.runner.as_ref()).await?;
+        {
+            let mut guard = self.state.lock().await;
+            guard.gateway_key_configured = true;
+        }
+        self.notify_snapshot();
+        let model_alias = {
+            let guard = self.state.lock().await;
+            guard
+                .sidecar_model_id
+                .clone()
+                .unwrap_or_else(|| "qwen2.5-vl-3b-q4".to_string())
+        };
+        let base_url = format!("http://127.0.0.1:{GATEWAY_PROXY_PORT}");
+        let claude_code_env = format!(
+            "ANTHROPIC_BASE_URL={base_url} ANTHROPIC_AUTH_TOKEN={key} claude --model {model_alias}"
+        );
+        Ok(GatewayClientConfig {
+            base_url,
+            api_key: key,
+            model_alias,
+            claude_code_env,
+        })
     }
 
     /// Reconciles `pending-session.json` and `active-session.json` against Colab on startup.
@@ -3657,6 +3967,7 @@ impl SessionManager {
         let handles = self.handles.clone();
         let intentional_stop = self.intentional_stop.clone();
         let snapshot_tx = self.snapshot_tx.clone();
+        let logs_ref = self.logs.clone();
 
         let task = tokio::spawn(async move {
             loop {
@@ -3715,10 +4026,39 @@ impl SessionManager {
                     .await
                     {
                         Ok(started) => {
-                            let mut h = handles.lock().await;
-                            h.tunnel_proc = Some(started.process);
-                            h.ctl_sock = Some(started.ctl_sock);
-                            h.comfy_sock = Some(started.comfy_sock);
+                            let new_ctl = started.ctl_sock.clone();
+                            let existing_llm_sock = {
+                                let mut h = handles.lock().await;
+                                h.tunnel_proc = Some(started.process);
+                                h.ctl_sock = Some(started.ctl_sock);
+                                h.comfy_sock = Some(started.comfy_sock);
+                                h.llm_sock.clone()
+                            };
+                            if let Some(llm_sock) = existing_llm_sock {
+                                if let Err(err) =
+                                    forward_llm_socket(&new_ctl, &llm_sock, runner.as_ref()).await
+                                {
+                                    let gw = {
+                                        let mut h = handles.lock().await;
+                                        h.llm_sock = None;
+                                        h.gateway.take()
+                                    };
+                                    if let Some(g) = gw {
+                                        g.shutdown().await;
+                                    }
+                                    let _ =
+                                        stop_remote_llama_server(&new_ctl, runner.as_ref()).await;
+                                    let mut guard = state.lock().await;
+                                    guard.sidecar_running = false;
+                                    guard.sidecar_model_id = None;
+                                    guard.gateway_running = false;
+                                    record_watchdog_log(
+                                        &logs_ref,
+                                        &data_dir,
+                                        format!("隧道重连后恢复 llm.sock 转发失败，已重置 Sidecar：{err}"),
+                                    );
+                                }
+                            }
                             let mut guard = state.lock().await;
                             guard.tunnel_connected = true;
                             guard.phase = SessionPhase::Ready;
@@ -3776,13 +4116,15 @@ impl SessionManager {
     }
 
     async fn teardown_local_handles(&self) {
-        let (proxy, mut tunnel_proc, ctl_sock, comfy_sock, sup, telem, sync_t) = {
+        let (proxy, gateway, mut tunnel_proc, ctl_sock, comfy_sock, llm_sock, sup, telem, sync_t) = {
             let mut h = self.handles.lock().await;
             (
                 h.proxy.take(),
+                h.gateway.take(),
                 h.tunnel_proc.take(),
                 h.ctl_sock.take(),
                 h.comfy_sock.take(),
+                h.llm_sock.take(),
                 h.supervisor_task.take(),
                 h.telemetry_task.take(),
                 h.sync_task.take(),
@@ -3797,8 +4139,14 @@ impl SessionManager {
         if let Some(task) = sync_t {
             task.abort();
         }
+        if let Some(gw) = gateway {
+            gw.shutdown().await;
+        }
         if let Some(p) = proxy {
             p.shutdown().await;
+        }
+        if let (Some(ctl), Some(llm)) = (ctl_sock.as_ref(), llm_sock.as_ref()) {
+            cancel_llm_socket(ctl, llm, self.runner.as_ref()).await;
         }
         if let (Some(ctl), Some(comfy)) = (ctl_sock, comfy_sock) {
             stop_master_tunnel(&ctl, &comfy, tunnel_proc.as_mut(), self.runner.as_ref()).await;
@@ -3819,6 +4167,10 @@ impl SessionManager {
         guard.watchdog = wd_snap;
         guard.low_balance_warning = false;
         guard.download_progress = None;
+        guard.sidecar_running = false;
+        guard.sidecar_model_id = None;
+        guard.gateway_running = false;
+        guard.last_interrogated_prompt = None;
     }
 
     /// Stops the active (or pending) Colab session and runs triple verification.
@@ -6375,5 +6727,91 @@ mod tests {
                 crate::watchdog::WatchdogPhase::Counting
             );
         });
+    }
+
+    #[test]
+    fn sidecar_rollback_on_forward_failure_and_teardown_resets_state() {
+        let dir = std::env::temp_dir().join(format!("ccu_sidecar_mgr_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let queue = StdMutex::new(VecDeque::from(vec![
+            // 1. probe_vm_sidecar_env
+            Ok(CommandOutput::from_raw(
+                Some(0),
+                "550.90.07, NVIDIA L4\n---GLIBC---\nldd (Ubuntu GLIBC 2.35) 2.35\n".to_string(),
+                String::new(),
+            )),
+            // 2. get_hf_token -> not found
+            Ok(CommandOutput::from_raw(
+                Some(44),
+                String::new(),
+                "could not be found".to_string(),
+            )),
+            // 3. start_remote_llama_server -> ok
+            Ok(CommandOutput::from_raw(
+                Some(0),
+                "LLAMA_SIDECAR_READY=1\n".to_string(),
+                String::new(),
+            )),
+            // 4. forward_llm_socket -> fail
+            Ok(CommandOutput::from_raw(
+                Some(1),
+                String::new(),
+                "forward denied".to_string(),
+            )),
+            // 5. rollback stop_remote_llama_server
+            Ok(CommandOutput::from_raw(
+                Some(0),
+                String::new(),
+                String::new(),
+            )),
+        ]));
+        struct LocalQueueRunner(StdMutex<VecDeque<Result<CommandOutput, CoreError>>>);
+        impl CommandRunner for LocalQueueRunner {
+            fn run<'a>(
+                &'a self,
+                _spec: CommandSpec,
+                _on_line: Option<LineCallback>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<CommandOutput, CoreError>> + Send + 'a>,
+            > {
+                let res = self.0.lock().unwrap().pop_front().unwrap();
+                Box::pin(async move { res })
+            }
+        }
+        let runner = Arc::new(LocalQueueRunner(queue));
+        let mgr = SessionManager::with_deps(
+            dir.clone(),
+            Some(dir.clone()),
+            None,
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        );
+        block_on(async {
+            {
+                let mut h = mgr.handles.lock().await;
+                h.ctl_sock = Some(dir.join("ssh/ctl-test"));
+            }
+            let err = mgr
+                .start_llm_sidecar("qwen2.5-vl-3b-q4".to_string())
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("llm.sock"));
+            assert!(!mgr.snapshot().await.sidecar_running);
+
+            {
+                let mut guard = mgr.state.lock().await;
+                guard.sidecar_running = true;
+                guard.sidecar_model_id = Some("qwen2.5-vl-3b-q4".to_string());
+                guard.gateway_running = true;
+            }
+            mgr.teardown_local_handles().await;
+            let snap = mgr.snapshot().await;
+            assert!(!snap.sidecar_running);
+            assert!(snap.sidecar_model_id.is_none());
+            assert!(!snap.gateway_running);
+        });
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -216,29 +216,32 @@ pub fn redact_sensitive_text(input: &str) -> String {
     );
     s = redact_key_value_ci(&s, "access_token=", is_query_delim, "[REDACTED]");
     s = redact_header_ci(&s, "x-goog-colab-token", "[REDACTED]");
+    s = redact_header_ci(&s, "x-api-key", "[REDACTED]");
     s = redact_bearer_ci(&s);
     s = redact_tun_paths(&s);
     s = redact_session_line_endpoints(&s);
     s = redact_colab_urls(&s);
     s = redact_m_s_endpoints(&s);
     s = redact_url_userinfo(&s);
-    s = redact_hf_tokens(&s);
+    s = redact_prefixed_tokens(&s, b"hf_");
+    s = redact_prefixed_tokens(&s, b"ccu_");
     s
 }
 
-fn redact_hf_tokens(input: &str) -> String {
+fn redact_prefixed_tokens(input: &str, prefix: &[u8]) -> String {
     let bytes = input.as_bytes();
+    let plen = prefix.len();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
-        if i + 19 <= bytes.len() && &bytes[i..i + 3] == b"hf_" {
+        if i + plen + 16 <= bytes.len() && &bytes[i..i + plen] == prefix {
             let boundary_before = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
             if boundary_before {
-                let mut end = i + 3;
+                let mut end = i + plen;
                 while end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
                     end += 1;
                 }
-                if end - (i + 3) >= 16 {
+                if end - (i + plen) >= 16 {
                     out.push_str("[REDACTED]");
                     i = end;
                     continue;
@@ -517,7 +520,9 @@ mod tests {
             "x-goog-colab-token: rt_secret_456\n",
             "https://oauth2.googleapis.com/tokeninfo?access_token=ya29.secret_qs\n",
             "https://oauth2:ghp_secret_token_999@github.com/example/node.git\n",
-            "auth failed for hf_AbCdEfGhIjKlMnOpQrStUvWxYz123456"
+            "auth failed for hf_AbCdEfGhIjKlMnOpQrStUvWxYz123456\n",
+            "x-api-key: ccu_secret_gateway_key_9876543210\n",
+            "token=ccu_AbCdEfGhIjKlMnOpQrStUvWxYz123456"
         );
 
         let redacted = redact_sensitive_text(sample);
@@ -530,6 +535,8 @@ mod tests {
             "us-central1.colab.googleusercontent.com",
             "ghp_secret_token_999",
             "hf_AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+            "ccu_secret_gateway_key_9876543210",
+            "ccu_AbCdEfGhIjKlMnOpQrStUvWxYz123456",
         ] {
             assert!(
                 !redacted.contains(secret),
