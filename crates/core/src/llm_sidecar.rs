@@ -222,6 +222,8 @@ pub async fn forward_llm_socket(
     let spec = CommandSpec::new(
         SSH_BIN.to_string(),
         vec![
+            "-F".to_string(),
+            "/dev/null".to_string(),
             "-S".to_string(),
             ctl_sock.display().to_string(),
             "-O".to_string(),
@@ -247,6 +249,8 @@ pub async fn cancel_llm_socket(ctl_sock: &Path, llm_sock: &Path, runner: &dyn Co
     let spec = CommandSpec::new(
         SSH_BIN.to_string(),
         vec![
+            "-F".to_string(),
+            "/dev/null".to_string(),
             "-S".to_string(),
             ctl_sock.display().to_string(),
             "-O".to_string(),
@@ -271,11 +275,12 @@ pub fn build_sidecar_launch_script(preset: &SidecarModelPreset, has_hf_token: bo
     let q_model_path = posix_single_quote(&model_path);
     let q_mmproj_path = posix_single_quote(&mmproj_path);
     let q_alias = posix_single_quote(&preset.id);
+    let needed_bytes = preset.total_bytes.saturating_add(2 * 1024 * 1024 * 1024);
 
-    let hf_auth = if has_hf_token {
-        "AUTH_ARGS=\"--header=Authorization: Bearer ${HF_TOKEN}\""
+    let read_token_block = if has_hf_token {
+        "IFS= read -r HF_TOKEN || true"
     } else {
-        "AUTH_ARGS=\"\""
+        "HF_TOKEN=\"\""
     };
 
     format!(
@@ -283,8 +288,13 @@ pub fn build_sidecar_launch_script(preset: &SidecarModelPreset, has_hf_token: bo
 set -euo pipefail
 rm -f -- "$0"
 HF_TOKEN=""
-if [ -t 0 ]; then :; else IFS= read -r HF_TOKEN || true; fi
-{hf_auth}
+{read_token_block}
+
+CONTENT_FREE=$(df -PB1 /content | awk 'NR==2{{print $4}}')
+if [ -n "${{CONTENT_FREE}}" ] && [ "${{CONTENT_FREE}}" -lt {needed_bytes} ]; then
+  echo "LLAMA_INSUFFICIENT_DISK=${{CONTENT_FREE}} < {needed_bytes}" >&2
+  exit 1
+fi
 
 mkdir -p /content/llama-bin {model_dir}
 if [ ! -x /content/llama-bin/llama-server ]; then
@@ -292,14 +302,14 @@ if [ ! -x /content/llama-bin/llama-server ]; then
     apt-get update -qq && apt-get install -y -qq aria2 >/dev/null 2>&1 || true
   fi
   TMP_TGZ=$(mktemp /tmp/.llama_bin.XXXXXX.tar.gz)
-  trap 'rm -f "${{TMP_TGZ}}"' EXIT
+  TMP_EXT=$(mktemp -d /tmp/.llama_ext.XXXXXX)
+  trap 'rm -rf "${{TMP_TGZ:-}}" "${{TMP_EXT:-}}"' EXIT
   curl -fsSL {q_bin_url} -o "${{TMP_TGZ}}"
   ACTUAL_SHA=$(sha256sum "${{TMP_TGZ}}" | awk '{{print $1}}')
   if [ "${{ACTUAL_SHA}}" != "{LLAMA_CPP_CUDA12_SHA256}" ]; then
     echo "LLAMA_SHA256_MISMATCH=${{ACTUAL_SHA}}" >&2
     exit 1
   fi
-  TMP_EXT=$(mktemp -d /tmp/.llama_ext.XXXXXX)
   tar -xzf "${{TMP_TGZ}}" -C "${{TMP_EXT}}"
   BIN_SRC=$(find "${{TMP_EXT}}" -name llama-server -type f | head -n 1)
   if [ -z "${{BIN_SRC}}" ]; then
@@ -307,7 +317,7 @@ if [ ! -x /content/llama-bin/llama-server ]; then
     exit 1
   fi
   BIN_DIR=$(dirname "${{BIN_SRC}}")
-  cp -f "${{BIN_DIR}}"/* /content/llama-bin/ 2>/dev/null || cp -f "${{BIN_SRC}}" /content/llama-bin/llama-server
+  cp -a "${{BIN_DIR}}/." /content/llama-bin/
   chmod +x /content/llama-bin/llama-server
   rm -rf "${{TMP_EXT}}" "${{TMP_TGZ}}"
 fi
@@ -325,16 +335,39 @@ download_if_needed() {{
     fi
   fi
   if command -v aria2c >/dev/null 2>&1; then
-    aria2c --console-log-level=warn --summary-interval=5 --auto-file-renaming=false -x 8 -s 8 -k 1M ${{AUTH_ARGS}} -d "$(dirname "${{dest}}")" -o "$(basename "${{dest}}")" "${{url}}"
+    if [ -n "${{HF_TOKEN:-}}" ]; then
+      printf "%s\n  header=Authorization: Bearer %s\n" "${{url}}" "${{HF_TOKEN}}" | \
+        aria2c --input-file=- --console-log-level=warn --summary-interval=5 --auto-file-renaming=false -c -x 8 -s 8 -k 1M -d "$(dirname "${{dest}}")" -o "$(basename "${{dest}}")"
+    else
+      printf "%s\n" "${{url}}" | \
+        aria2c --input-file=- --console-log-level=warn --summary-interval=5 --auto-file-renaming=false -c -x 8 -s 8 -k 1M -d "$(dirname "${{dest}}")" -o "$(basename "${{dest}}")"
+    fi
   else
-    curl -fsSL ${{HF_TOKEN:+-H "Authorization: Bearer ${{HF_TOKEN}}"}} "${{url}}" -o "${{dest}}"
+    if [ -n "${{HF_TOKEN:-}}" ]; then
+      printf 'header = "Authorization: Bearer %s"\n' "${{HF_TOKEN}}" | \
+        curl -fsSL -C - -K - "${{url}}" -o "${{dest}}"
+    else
+      curl -fsSL -C - "${{url}}" -o "${{dest}}"
+    fi
+  fi
+  local dl_sz
+  dl_sz=$(stat -c%s "${{dest}}" 2>/dev/null || echo 0)
+  if [ "${{expected}}" -gt 0 ] && [ "${{dl_sz}}" != "${{expected}}" ]; then
+    echo "SIDECAR_SIZE_MISMATCH=${{dl_sz}} != ${{expected}} (${{dest}})" >&2
+    exit 1
+  fi
+  local head_prefix
+  head_prefix=$(head -c 64 "${{dest}}" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+  if [[ "${{head_prefix}}" == *"<!doctype"* ]] || [[ "${{head_prefix}}" == *"<html"* ]]; then
+    echo "SIDECAR_HTML_ERROR_PAGE=${{dest}}" >&2
+    exit 1
   fi
 }}
 
 download_if_needed {q_model_url} {q_model_path} {model_size}
 download_if_needed {q_mmproj_url} {q_mmproj_path} {mmproj_size}
 
-pkill -f '/content/llama-bin/llama-server' || true
+pkill -f '[l]lama-bin/llama-server' || true
 sleep 1
 export LD_LIBRARY_PATH="/content/llama-bin:/usr/local/cuda/lib64:${{LD_LIBRARY_PATH:-}}"
 nohup /content/llama-bin/llama-server \
@@ -355,6 +388,7 @@ for i in $(seq 1 90); do
   sleep 1
 done
 tail -n 30 /tmp/llama-server.log >&2 || true
+pkill -f '[l]lama-bin/llama-server' || true
 exit 1
 "#,
         model_size = preset.model_size_bytes,
@@ -369,22 +403,21 @@ pub async fn start_remote_llama_server(
     runner: &dyn CommandRunner,
     on_line: Option<LineCallback>,
 ) -> Result<(), CoreError> {
-    let script = build_sidecar_launch_script(preset, hf_token.is_some());
-    let mut stdin_bytes = Vec::new();
-    if let Some(tok) = hf_token {
-        stdin_bytes.extend_from_slice(tok.as_bytes());
-        stdin_bytes.push(b'\n');
-    }
-    stdin_bytes.extend_from_slice(script.as_bytes());
-
-    let remote_cmd =
-        "TMP_S=$(mktemp /tmp/.llama_start.XXXXXX.sh) && cat > \"$TMP_S\" && bash \"$TMP_S\"";
-    let spec = build_mux_exec_spec(
-        ctl_sock,
-        remote_cmd,
-        StdinPolicy::Bytes(stdin_bytes),
-        Duration::from_secs(1800),
+    let clean_token = hf_token.map(str::trim).filter(|t| !t.is_empty());
+    let script = build_sidecar_launch_script(preset, clean_token.is_some());
+    let encoded = encode_base64(script.as_bytes());
+    let remote_cmd = format!(
+        "tmp_sh=\"$(mktemp /tmp/.llama_start.XXXXXX.sh)\" && printf '%s' '{encoded}' | base64 -d > \"${{tmp_sh}}\" && chmod 700 \"${{tmp_sh}}\" && bash \"${{tmp_sh}}\"; rc=$?; rm -f \"${{tmp_sh}}\"; exit $rc"
     );
+    let stdin = match clean_token {
+        Some(tok) => {
+            let mut b = tok.as_bytes().to_vec();
+            b.push(b'\n');
+            StdinPolicy::Bytes(b)
+        }
+        None => StdinPolicy::Null,
+    };
+    let spec = build_mux_exec_spec(ctl_sock, &remote_cmd, stdin, Duration::from_secs(1800));
     let out = runner.run(spec, on_line).await?;
     if out.exit_code != Some(0) || !out.stdout.contains("LLAMA_SIDECAR_READY=1") {
         return Err(CoreError::CommandFailed {
@@ -402,7 +435,7 @@ pub async fn stop_remote_llama_server(
 ) -> Result<(), CoreError> {
     let spec = build_mux_exec_spec(
         ctl_sock,
-        "pkill -f '/content/llama-bin/llama-server' || true",
+        "pkill -f '[l]lama-bin/llama-server' || true",
         StdinPolicy::Null,
         Duration::from_secs(15),
     );
@@ -512,6 +545,11 @@ pub async fn interrogate_image_over_socket(
             context: format!("stat image {}", image_path.display()),
             source,
         })?;
+    if !meta.is_file() {
+        return Err(CoreError::InvalidInput {
+            detail: "反推目标不是有效图片文件".to_string(),
+        });
+    }
     if meta.len() > MAX_IMAGE_BYTES {
         return Err(CoreError::InvalidInput {
             detail: "图片体积超过 16 MiB 上限，请先压缩后再反推".to_string(),
@@ -627,7 +665,68 @@ mod tests {
         assert!(script.contains(LLAMA_CPP_CUDA12_SHA256));
         assert!(script.contains("--port 8081"));
         assert!(script.contains("--mmproj"));
+        assert!(script.contains("--input-file=-"));
+        assert!(script.contains("-K -"));
+        assert!(script.contains("[l]lama-bin/llama-server"));
+        assert!(script.contains("SIDECAR_HTML_ERROR_PAGE"));
         assert!(script.contains("rm -f -- \"$0\""));
+    }
+
+    #[test]
+    fn start_remote_llama_server_passes_only_token_in_stdin_and_base64_script_in_cmd() {
+        use crate::runner::CommandOutput;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+
+        struct CaptureRunner {
+            seen_args: Mutex<Vec<Vec<String>>>,
+            seen_stdin: Mutex<Vec<Vec<u8>>>,
+        }
+        impl CommandRunner for CaptureRunner {
+            fn run<'a>(
+                &'a self,
+                spec: CommandSpec,
+                _on_line: Option<LineCallback>,
+            ) -> Pin<Box<dyn Future<Output = Result<CommandOutput, CoreError>> + Send + 'a>>
+            {
+                self.seen_args.lock().unwrap().push(spec.args.clone());
+                if let StdinPolicy::Bytes(b) = &spec.stdin {
+                    self.seen_stdin.lock().unwrap().push(b.clone());
+                }
+                Box::pin(async move {
+                    Ok(CommandOutput::from_raw(
+                        Some(0),
+                        "LLAMA_SIDECAR_READY=1\n".to_string(),
+                        String::new(),
+                    ))
+                })
+            }
+        }
+
+        let runner = CaptureRunner {
+            seen_args: Mutex::new(Vec::new()),
+            seen_stdin: Mutex::new(Vec::new()),
+        };
+        let preset = &builtin_sidecar_models()[0];
+        let tok = "hf_secret_sidecar_token_123456";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(start_remote_llama_server(
+            Path::new("/tmp/ctl"),
+            preset,
+            Some(tok),
+            &runner,
+            None,
+        ))
+        .unwrap();
+
+        let args = runner.seen_args.lock().unwrap();
+        assert!(!args[0].iter().any(|a| a.contains(tok)));
+        assert!(args[0].last().unwrap().contains("base64 -d"));
+        let stdin = runner.seen_stdin.lock().unwrap();
+        assert_eq!(String::from_utf8_lossy(&stdin[0]), format!("{tok}\n"));
     }
 
     #[test]

@@ -527,6 +527,7 @@ pub struct SessionManager {
     low_balance_notified: Arc<AtomicBool>,
     download_in_flight: Arc<AtomicBool>,
     sync_mutex: Arc<Mutex<()>>,
+    sidecar_mutex: Arc<Mutex<()>>,
 }
 
 impl SessionManager {
@@ -672,6 +673,7 @@ impl SessionManager {
             low_balance_notified: Arc::new(AtomicBool::new(false)),
             download_in_flight: Arc::new(AtomicBool::new(false)),
             sync_mutex: Arc::new(Mutex::new(())),
+            sidecar_mutex: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1680,6 +1682,7 @@ impl SessionManager {
     }
 
     pub async fn start_llm_sidecar(&self, model_id: String) -> Result<AppSnapshot, CoreError> {
+        let _sidecar_guard = self.sidecar_mutex.lock().await;
         let preset = builtin_sidecar_models()
             .into_iter()
             .find(|m| m.id == model_id)
@@ -1729,7 +1732,10 @@ impl SessionManager {
             Some(cb),
         )
         .await?;
-        forward_llm_socket(&ctl_sock, &llm_sock, self.runner.as_ref()).await?;
+        if let Err(err) = forward_llm_socket(&ctl_sock, &llm_sock, self.runner.as_ref()).await {
+            let _ = stop_remote_llama_server(&ctl_sock, self.runner.as_ref()).await;
+            return Err(err);
+        }
 
         {
             let mut h = self.handles.lock().await;
@@ -1756,6 +1762,7 @@ impl SessionManager {
     }
 
     pub async fn stop_llm_sidecar(&self) -> Result<AppSnapshot, CoreError> {
+        let _sidecar_guard = self.sidecar_mutex.lock().await;
         let (gw, llm_sock, ctl_sock) = {
             let mut h = self.handles.lock().await;
             (h.gateway.take(), h.llm_sock.take(), h.ctl_sock.clone())
@@ -1906,6 +1913,7 @@ impl SessionManager {
             let mut guard = self.state.lock().await;
             guard.gateway_key_configured = true;
         }
+        self.notify_snapshot();
         let model_alias = {
             let guard = self.state.lock().await;
             guard
@@ -3959,6 +3967,7 @@ impl SessionManager {
         let handles = self.handles.clone();
         let intentional_stop = self.intentional_stop.clone();
         let snapshot_tx = self.snapshot_tx.clone();
+        let logs_ref = self.logs.clone();
 
         let task = tokio::spawn(async move {
             loop {
@@ -4017,10 +4026,39 @@ impl SessionManager {
                     .await
                     {
                         Ok(started) => {
-                            let mut h = handles.lock().await;
-                            h.tunnel_proc = Some(started.process);
-                            h.ctl_sock = Some(started.ctl_sock);
-                            h.comfy_sock = Some(started.comfy_sock);
+                            let new_ctl = started.ctl_sock.clone();
+                            let existing_llm_sock = {
+                                let mut h = handles.lock().await;
+                                h.tunnel_proc = Some(started.process);
+                                h.ctl_sock = Some(started.ctl_sock);
+                                h.comfy_sock = Some(started.comfy_sock);
+                                h.llm_sock.clone()
+                            };
+                            if let Some(llm_sock) = existing_llm_sock {
+                                if let Err(err) =
+                                    forward_llm_socket(&new_ctl, &llm_sock, runner.as_ref()).await
+                                {
+                                    let gw = {
+                                        let mut h = handles.lock().await;
+                                        h.llm_sock = None;
+                                        h.gateway.take()
+                                    };
+                                    if let Some(g) = gw {
+                                        g.shutdown().await;
+                                    }
+                                    let _ =
+                                        stop_remote_llama_server(&new_ctl, runner.as_ref()).await;
+                                    let mut guard = state.lock().await;
+                                    guard.sidecar_running = false;
+                                    guard.sidecar_model_id = None;
+                                    guard.gateway_running = false;
+                                    record_watchdog_log(
+                                        &logs_ref,
+                                        &data_dir,
+                                        format!("隧道重连后恢复 llm.sock 转发失败，已重置 Sidecar：{err}"),
+                                    );
+                                }
+                            }
                             let mut guard = state.lock().await;
                             guard.tunnel_connected = true;
                             guard.phase = SessionPhase::Ready;
@@ -6689,5 +6727,91 @@ mod tests {
                 crate::watchdog::WatchdogPhase::Counting
             );
         });
+    }
+
+    #[test]
+    fn sidecar_rollback_on_forward_failure_and_teardown_resets_state() {
+        let dir = std::env::temp_dir().join(format!("ccu_sidecar_mgr_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let queue = StdMutex::new(VecDeque::from(vec![
+            // 1. probe_vm_sidecar_env
+            Ok(CommandOutput::from_raw(
+                Some(0),
+                "550.90.07, NVIDIA L4\n---GLIBC---\nldd (Ubuntu GLIBC 2.35) 2.35\n".to_string(),
+                String::new(),
+            )),
+            // 2. get_hf_token -> not found
+            Ok(CommandOutput::from_raw(
+                Some(44),
+                String::new(),
+                "could not be found".to_string(),
+            )),
+            // 3. start_remote_llama_server -> ok
+            Ok(CommandOutput::from_raw(
+                Some(0),
+                "LLAMA_SIDECAR_READY=1\n".to_string(),
+                String::new(),
+            )),
+            // 4. forward_llm_socket -> fail
+            Ok(CommandOutput::from_raw(
+                Some(1),
+                String::new(),
+                "forward denied".to_string(),
+            )),
+            // 5. rollback stop_remote_llama_server
+            Ok(CommandOutput::from_raw(
+                Some(0),
+                String::new(),
+                String::new(),
+            )),
+        ]));
+        struct LocalQueueRunner(StdMutex<VecDeque<Result<CommandOutput, CoreError>>>);
+        impl CommandRunner for LocalQueueRunner {
+            fn run<'a>(
+                &'a self,
+                _spec: CommandSpec,
+                _on_line: Option<LineCallback>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<CommandOutput, CoreError>> + Send + 'a>,
+            > {
+                let res = self.0.lock().unwrap().pop_front().unwrap();
+                Box::pin(async move { res })
+            }
+        }
+        let runner = Arc::new(LocalQueueRunner(queue));
+        let mgr = SessionManager::with_deps(
+            dir.clone(),
+            Some(dir.clone()),
+            None,
+            0,
+            runner,
+            Arc::new(MockSpawner),
+        );
+        block_on(async {
+            {
+                let mut h = mgr.handles.lock().await;
+                h.ctl_sock = Some(dir.join("ssh/ctl-test"));
+            }
+            let err = mgr
+                .start_llm_sidecar("qwen2.5-vl-3b-q4".to_string())
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("llm.sock"));
+            assert!(!mgr.snapshot().await.sidecar_running);
+
+            {
+                let mut guard = mgr.state.lock().await;
+                guard.sidecar_running = true;
+                guard.sidecar_model_id = Some("qwen2.5-vl-3b-q4".to_string());
+                guard.gateway_running = true;
+            }
+            mgr.teardown_local_handles().await;
+            let snap = mgr.snapshot().await;
+            assert!(!snap.sidecar_running);
+            assert!(snap.sidecar_model_id.is_none());
+            assert!(!snap.gateway_running);
+        });
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -520,7 +520,9 @@ mod tests {
             "x-goog-colab-token: rt_secret_456\n",
             "https://oauth2.googleapis.com/tokeninfo?access_token=ya29.secret_qs\n",
             "https://oauth2:ghp_secret_token_999@github.com/example/node.git\n",
-            "auth failed for hf_AbCdEfGhIjKlMnOpQrStUvWxYz123456"
+            "auth failed for hf_AbCdEfGhIjKlMnOpQrStUvWxYz123456\n",
+            "x-api-key: ccu_secret_gateway_key_9876543210\n",
+            "token=ccu_AbCdEfGhIjKlMnOpQrStUvWxYz123456"
         );
 
         let redacted = redact_sensitive_text(sample);
@@ -533,6 +535,8 @@ mod tests {
             "us-central1.colab.googleusercontent.com",
             "ghp_secret_token_999",
             "hf_AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+            "ccu_secret_gateway_key_9876543210",
+            "ccu_AbCdEfGhIjKlMnOpQrStUvWxYz123456",
         ] {
             assert!(
                 !redacted.contains(secret),

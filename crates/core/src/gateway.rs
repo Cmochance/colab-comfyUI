@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,6 +17,7 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Running local loopback API gateway forwarding `127.0.0.1:<port>` to `llm.sock`.
 pub struct GatewayHandle {
     pub port: u16,
+    conns: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -25,6 +27,14 @@ impl GatewayHandle {
             task.abort();
             let _ = task.await;
         }
+        let handles = {
+            let mut guard = self.conns.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for h in handles {
+            h.abort();
+            let _ = h.await;
+        }
     }
 }
 
@@ -32,6 +42,11 @@ impl Drop for GatewayHandle {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
+        }
+        if let Ok(mut guard) = self.conns.lock() {
+            for h in guard.drain(..) {
+                h.abort();
+            }
         }
     }
 }
@@ -70,18 +85,25 @@ pub async fn start_gateway_proxy(
         })?
         .port();
 
+    let conns: Arc<StdMutex<Vec<JoinHandle<()>>>> = Arc::new(StdMutex::new(Vec::new()));
+    let conns_ref = conns.clone();
     let task = tokio::spawn(async move {
         while let Ok((stream, _peer)) = listener.accept().await {
             let sock = llm_sock_path.clone();
             let key = api_key.clone();
-            tokio::spawn(async move {
+            let h = tokio::spawn(async move {
                 let _ = handle_gateway_connection(stream, actual_port, sock, key).await;
             });
+            if let Ok(mut guard) = conns_ref.lock() {
+                guard.retain(|existing| !existing.is_finished());
+                guard.push(h);
+            }
         }
     });
 
     Ok(GatewayHandle {
         port: actual_port,
+        conns,
         task: Some(task),
     })
 }
@@ -128,6 +150,18 @@ async fn write_json_error(
     stream.shutdown().await
 }
 
+fn is_allowed_endpoint(method: &str, raw_path: &str) -> bool {
+    let path = raw_path.split('?').next().unwrap_or(raw_path);
+    matches!(
+        (method, path),
+        ("POST", "/v1/messages")
+            | ("POST", "/v1/messages/count_tokens")
+            | ("POST", "/v1/chat/completions")
+            | ("GET", "/v1/models")
+            | ("GET", "/health")
+    )
+}
+
 async fn handle_gateway_connection(
     mut client: TcpStream,
     port: u16,
@@ -161,54 +195,81 @@ async fn handle_gateway_connection(
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "header timeout"))??;
 
-    let head_str = String::from_utf8_lossy(&buf[..header_end - 4]);
-    let mut lines = head_str.split("\r\n");
-    let Some(request_line) = lines.next() else {
+    let mut headers = [httparse::EMPTY_HEADER; 128];
+    let mut req = httparse::Request::new(&mut headers);
+    let parsed = matches!(
+        req.parse(&buf[..header_end]),
+        Ok(httparse::Status::Complete(_))
+    );
+    if !parsed {
         return write_json_error(
             &mut client,
             "400 Bad Request",
             "invalid_request_error",
-            "Empty request",
+            "Malformed HTTP request",
+        )
+        .await;
+    }
+
+    let (Some(method), Some(path)) = (req.method, req.path) else {
+        return write_json_error(
+            &mut client,
+            "400 Bad Request",
+            "invalid_request_error",
+            "Missing HTTP method or path",
         )
         .await;
     };
 
-    let mut host_ok = false;
-    let mut origin_ok = true;
-    let mut provided_key: Option<String> = None;
+    let mut host_count = 0usize;
+    let mut host_all_ok = true;
+    let mut origin_all_ok = true;
+    let mut provided_keys: Vec<String> = Vec::new();
     let mut forwarded_headers = Vec::new();
 
-    for line in lines {
-        let Some((name, val)) = line.split_once(':') else {
-            continue;
-        };
-        let name_t = name.trim();
-        let val_t = val.trim();
-        if name_t.eq_ignore_ascii_case("host") {
-            host_ok = is_allowed_host(val_t, port);
-            continue;
-        }
-        if name_t.eq_ignore_ascii_case("origin") {
-            origin_ok = is_allowed_origin(val_t, port);
-            continue;
-        }
-        if name_t.eq_ignore_ascii_case("authorization") {
-            if let Some(rest) = val_t
-                .strip_prefix("Bearer ")
-                .or_else(|| val_t.strip_prefix("bearer "))
-            {
-                provided_key = Some(rest.trim().to_string());
+    for h in req.headers.iter() {
+        let name = h.name;
+        let val = String::from_utf8_lossy(h.value).trim().to_string();
+        if name.eq_ignore_ascii_case("host") {
+            host_count += 1;
+            if !is_allowed_host(&val, port) {
+                host_all_ok = false;
             }
             continue;
         }
-        if name_t.eq_ignore_ascii_case("x-api-key") {
-            provided_key = Some(val_t.to_string());
+        if name.eq_ignore_ascii_case("origin") {
+            if !is_allowed_origin(&val, port) {
+                origin_all_ok = false;
+            }
             continue;
         }
-        forwarded_headers.push(format!("{name_t}: {val_t}"));
+        if name.eq_ignore_ascii_case("authorization") {
+            let key = val
+                .strip_prefix("Bearer ")
+                .or_else(|| val.strip_prefix("bearer "))
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            provided_keys.push(key);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("x-api-key") {
+            provided_keys.push(val);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("keep-alive")
+            || name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("upgrade")
+            || name.eq_ignore_ascii_case("proxy-authenticate")
+            || name.eq_ignore_ascii_case("proxy-authorization")
+        {
+            continue;
+        }
+        forwarded_headers.push(format!("{name}: {val}"));
     }
 
-    if !host_ok || !origin_ok {
+    if host_count != 1 || !host_all_ok || !origin_all_ok {
         return write_json_error(
             &mut client,
             "403 Forbidden",
@@ -218,15 +279,26 @@ async fn handle_gateway_connection(
         .await;
     }
 
-    let authed = provided_key
-        .as_deref()
-        .is_some_and(|k| constant_time_eq(k.as_bytes(), expected_key.as_bytes()));
+    let authed = !provided_keys.is_empty()
+        && provided_keys
+            .iter()
+            .all(|k| constant_time_eq(k.as_bytes(), expected_key.as_bytes()));
     if !authed {
         return write_json_error(
             &mut client,
             "401 Unauthorized",
             "authentication_error",
             "Invalid or missing API key",
+        )
+        .await;
+    }
+
+    if !is_allowed_endpoint(method, path) {
+        return write_json_error(
+            &mut client,
+            "404 Not Found",
+            "not_found_error",
+            "Endpoint not exposed by gateway",
         )
         .await;
     }
@@ -244,7 +316,9 @@ async fn handle_gateway_connection(
         }
     };
 
-    let mut rewritten = format!("{request_line}\r\nHost: 127.0.0.1:{REMOTE_LLM_PORT}\r\n");
+    let mut rewritten = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{REMOTE_LLM_PORT}\r\nConnection: close\r\n"
+    );
     for h in forwarded_headers {
         rewritten.push_str(&h);
         rewritten.push_str("\r\n");
@@ -358,14 +432,60 @@ mod tests {
             assert!(r3.starts_with("HTTP/1.1 200"));
             assert!(r3.contains("event: message_start"));
 
-            // 4. Valid OpenAI Bearer -> 200 passthrough
+            // 4. Valid OpenAI Bearer -> 200 passthrough + Connection: close injected
             let r4 = send_raw(
                 port,
-                &format!("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n"),
+                &format!("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\nAuthorization: Bearer {key}\r\n\r\n"),
             )
             .await;
             assert!(r4.starts_with("HTTP/1.1 200"));
             assert!(r4.contains("chatcmpl-1"));
+
+            // 5. Wrong Host / multi Origin / multi Host -> 403
+            let r5 = send_raw(
+                port,
+                &format!("POST /v1/messages HTTP/1.1\r\nHost: evil.example:{port}\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(r5.starts_with("HTTP/1.1 403"));
+
+            let r6 = send_raw(
+                port,
+                &format!("POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nOrigin: http://127.0.0.1:{port}\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(r6.starts_with("HTTP/1.1 403"));
+
+            // 6. Wrong key -> 401
+            let r7 = send_raw(
+                port,
+                &format!("POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nx-api-key: ccu_wrong\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(r7.starts_with("HTTP/1.1 401"));
+
+            // 7. Non-allowlisted path -> 404
+            let r8 = send_raw(
+                port,
+                &format!("GET /props HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(r8.starts_with("HTTP/1.1 404"));
+
+            // 8. /v1/models & /v1/messages/count_tokens -> 200
+            let r9 = send_raw(
+                port,
+                &format!("GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(r9.starts_with("HTTP/1.1 200"));
+
+            let r10 = send_raw(
+                port,
+                &format!("POST /v1/messages/count_tokens HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(r10.starts_with("HTTP/1.1 200"));
 
             gw.shutdown().await;
             let _ = std::fs::remove_dir_all(&dir);
