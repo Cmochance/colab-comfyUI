@@ -17,16 +17,16 @@
 
 ## Current state
 
-Usable (**v0.2.0 Phase 1 MVP**):
+Usable (**v0.3.0 Phase 2**):
 
 - One-click launch: supports `L4` (`High-RAM` disabled), `T4`, `G4`, `A100`, and `H100`, with preflight `colab` auth and compute-unit balance checks (confirm prompt on 0 CU)
-- Zero-exposure local tunnel: single-slot SSH `ControlMaster` forwarding to a local Unix socket behind a `127.0.0.1:18188` `Host`/`Origin`-validated reverse proxy (no public tunnels, no `--enable-cors-header`)
-- Isolated dual windows: the `main` shell manages session lifecycle, live launch progress, and redacted logs (also persisted to `0600` `~/.colab-comfyui/app.log`), while the `canvas` window displays ComfyUI with zero Tauri IPC permissions
+- Google Drive persistence (zero token upload): interactive browser OAuth prompt for `drivemount`, frozen core Colab package constraints (`-c /tmp/colab_constraints.txt`), commit-pinned `custom_nodes_repos.txt`, byte-verified directory linking, `--no-drive` symlink/YAML cleanup, and manual/pre-stop `/history` workflow export + `drive.flush_and_unmount()` (non-blocking on stop)
+- Live GPU & CU telemetry: 3s local proxy VRAM/RAM/queue polling, 20s `ControlMaster`-reused `nvidia-smi` & disk probe, 60s `colab usage` remaining-time estimate, 120-sample live chart, live Chinese/English switching, and a privacy-mask toggle
+- Zero-exposure local tunnel & dual windows: single-slot SSH `ControlMaster` + Unix socket + `127.0.0.1:18188` `Host`/`Origin`-validated reverse proxy, with zero Tauri IPC permissions on the `canvas` window
 - Billing safeguards: two-phase local session ledger (`~/.colab-comfyui/`), startup reconciliation, three-way exit confirmation, triple-verified stop reports, and a link to manage `[?]` orphan sessions
 
 Planned next:
 
-- Google Drive persistence, pre-stop export, and live GPU/compute-unit telemetry
 - `agy-cs` multi-account integration and sleep-aware idle watchdogs
 - Verified model/workflow catalog and automatic output gallery sync
 - On-demand vision prompt helper and fixed-port local API proxy

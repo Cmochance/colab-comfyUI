@@ -54,6 +54,14 @@ impl GpuTier {
     }
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_drive_export_timeout_secs() -> u64 {
+    90
+}
+
 /// Non-sensitive local user configuration persisted in `<data_dir>/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -63,6 +71,14 @@ pub struct AppConfig {
     pub default_gpu: GpuTier,
     #[serde(default)]
     pub high_mem: bool,
+    #[serde(default = "default_true")]
+    pub use_drive: bool,
+    #[serde(default = "default_true")]
+    pub export_outputs_on_stop: bool,
+    #[serde(default)]
+    pub privacy_mask: bool,
+    #[serde(default = "default_drive_export_timeout_secs")]
+    pub drive_export_timeout_secs: u64,
 }
 
 impl Default for AppConfig {
@@ -71,6 +87,10 @@ impl Default for AppConfig {
             locale: Locale::ZhHans,
             default_gpu: GpuTier::L4,
             high_mem: false,
+            use_drive: true,
+            export_outputs_on_stop: true,
+            privacy_mask: false,
+            drive_export_timeout_secs: default_drive_export_timeout_secs(),
         }
     }
 }
@@ -85,6 +105,8 @@ pub struct PendingSession {
     pub cancel_requested: bool,
     #[serde(default)]
     pub uncertain_orphan: bool,
+    #[serde(default)]
+    pub drive_enabled: bool,
     pub created_at_unix: u64,
 }
 
@@ -99,6 +121,8 @@ pub struct ActiveSession {
     pub high_mem: bool,
     pub hardware_summary: String,
     pub local_port: u16,
+    #[serde(default)]
+    pub drive_enabled: bool,
     pub created_at_unix: u64,
 }
 
@@ -449,6 +473,7 @@ mod tests {
             high_mem: false,
             hardware_summary: "GPU L4".to_string(),
             local_port: LOCAL_PROXY_PORT,
+            drive_enabled: true,
             created_at_unix: 1_700_000_000,
         };
         save_json_0600(&target, &session).unwrap();

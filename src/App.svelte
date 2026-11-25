@@ -34,6 +34,7 @@
     high_mem: boolean;
     hardware_summary: string;
     local_port: number;
+    drive_enabled: boolean;
     created_at_unix: number;
   }
 
@@ -44,6 +45,7 @@
     high_mem: boolean;
     cancel_requested: boolean;
     uncertain_orphan: boolean;
+    drive_enabled: boolean;
     created_at_unix: number;
   }
 
@@ -67,8 +69,56 @@
     safe_to_clear_ledger: boolean;
     usage: UsageInfo | null;
     billing_verified_stopped: boolean;
+    drive_sync_confirmed?: boolean | null;
     summary: string;
     warnings: string[];
+  }
+
+  interface DriveAuthPrompt {
+    auth_url: string | null;
+    started_at_unix: number;
+    deadline_unix: number;
+    grace_deadline_unix?: number | null;
+    attempt: number;
+    max_attempts: number;
+    status: 'WaitingUser' | 'Continuing' | 'Failed';
+    message: string | null;
+  }
+
+  interface DriveExportReport {
+    ok: boolean;
+    flush_ok: boolean;
+    workflow_updated: boolean;
+    user_files: number;
+    output_files: number;
+    input_files: number;
+    custom_nodes_count: number;
+    summary: string;
+  }
+
+  interface TelemetrySample {
+    timestamp_unix: number;
+    gpu_util_pct: number | null;
+    vram_pct: number | null;
+    ram_pct: number | null;
+  }
+
+  interface TelemetrySnapshot {
+    gpu_name: string | null;
+    gpu_util_pct: number | null;
+    gpu_temp_c: number | null;
+    vram_used_bytes: number | null;
+    vram_total_bytes: number | null;
+    ram_used_bytes: number | null;
+    ram_total_bytes: number | null;
+    queue_running: number;
+    queue_pending: number;
+    content_free_bytes: number | null;
+    content_total_bytes: number | null;
+    drive_free_bytes: number | null;
+    drive_total_bytes: number | null;
+    estimated_remaining_minutes: number | null;
+    samples: TelemetrySample[];
   }
 
   interface AppSnapshot {
@@ -76,9 +126,13 @@
     step: StartStep | null;
     env: EnvReport;
     config: {
-      locale: string;
+      locale: 'zh-Hans' | 'en';
       default_gpu: GpuTier;
       high_mem: boolean;
+      use_drive: boolean;
+      export_outputs_on_stop: boolean;
+      drive_export_timeout_secs?: number;
+      privacy_mask: boolean;
     };
     account_email: string | null;
     auth_required: boolean;
@@ -93,6 +147,9 @@
     last_stop_report: StopReport | null;
     tunnel_connected: boolean;
     canvas_url: string | null;
+    drive_auth: DriveAuthPrompt | null;
+    telemetry: TelemetrySnapshot;
+    last_export_report: DriveExportReport | null;
     logs: string[];
     i18n: Record<string, string>;
   }
@@ -117,20 +174,56 @@
   let snap = $state<AppSnapshot | null>(null);
   let selectedGpu = $state<GpuTier>('L4');
   let highMem = $state(false);
+  let useDrive = $state(true);
+  let exportOutputsOnStop = $state(true);
+  let driveExportTimeoutSecs = $state(90);
+  let privacyMask = $state(false);
   let configSynced = $state(false);
   let starting = $state(false);
   let stopping = $state(false);
   let reconnecting = $state(false);
   let refreshing = $state(false);
+  let exporting = $state(false);
   let exitBusy = $state(false);
   let logsExpanded = $state(false);
   let showZeroCuModal = $state(false);
   let showExitModal = $state(false);
   let actionError = $state<UiError | null>(null);
   let elapsedSecs = $state(0);
+  let driveRemainingSecs = $state(0);
+  let driveGraceRemainingSecs = $state(0);
 
-  const busy = $derived(starting || stopping || reconnecting || refreshing || exitBusy);
+  const busy = $derived(starting || stopping || reconnecting || refreshing || exporting || exitBusy);
   const t = (key: string, fallback: string) => snap?.i18n?.[key] ?? fallback;
+
+  function formatGiB(bytes: number | null | undefined): string {
+    if (bytes == null) return '--';
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+
+  function formatDurationMinutes(mins: number | null | undefined): string {
+    if (mins == null) return t('cu_unlimited_or_idle', '0.00/hr');
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  }
+
+  function svgPolyline(samples: TelemetrySample[], pick: (s: TelemetrySample) => number | null): string {
+    const W = 320;
+    const H = 80;
+    const n = samples.length;
+    if (n === 0) return '';
+    const pts: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const val = pick(samples[i]);
+      if (val == null || Number.isNaN(val)) continue;
+      const x = n === 1 ? W : (i / (n - 1)) * W;
+      const clamped = Math.max(0, Math.min(100, val));
+      const y = H - (clamped / 100) * (H - 8) - 4;
+      pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+    }
+    return pts.join(' ');
+  }
 
   const highMemSupported = $derived(selectedGpu !== 'L4');
   const isTimedPhase = $derived(snap?.phase === 'Starting' || snap?.phase === 'Reconnecting');
@@ -159,6 +252,25 @@
   });
 
   $effect(() => {
+    const da = snap?.drive_auth;
+    if (!da) {
+      driveRemainingSecs = 0;
+      driveGraceRemainingSecs = 0;
+      return;
+    }
+    const updateCountdown = () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      driveRemainingSecs = Math.max(0, da.deadline_unix - nowSec);
+      driveGraceRemainingSecs = da.grace_deadline_unix
+        ? Math.max(0, da.grace_deadline_unix - nowSec)
+        : 0;
+    };
+    updateCountdown();
+    const timer = setInterval(updateCountdown, 1000);
+    return () => clearInterval(timer);
+  });
+
+  $effect(() => {
     let unlistenSnapshot: (() => void) | undefined;
     let unlistenExit: (() => void) | undefined;
 
@@ -168,6 +280,10 @@
       if (!configSynced) {
         selectedGpu = s.config.default_gpu;
         highMem = s.config.default_gpu !== 'L4' && s.config.high_mem;
+        useDrive = s.config.use_drive;
+        exportOutputsOnStop = s.config.export_outputs_on_stop;
+        driveExportTimeoutSecs = s.config.drive_export_timeout_secs ?? 90;
+        privacyMask = s.config.privacy_mask;
         configSynced = true;
       }
     });
@@ -316,8 +432,75 @@
   async function runLeaveRunningAndExit() {
     await invoke('leave_running_and_exit');
   }
+
+  async function savePreferences(patch: {
+    locale?: 'zh-Hans' | 'en';
+    useDrive?: boolean;
+    exportOutputsOnStop?: boolean;
+    privacyMask?: boolean;
+    driveExportTimeoutSecs?: number;
+  }) {
+    try {
+      snap = await invoke<AppSnapshot>('update_preferences', {
+        locale: patch.locale ?? null,
+        useDrive: patch.useDrive ?? null,
+        exportOutputsOnStop: patch.exportOutputsOnStop ?? null,
+        privacyMask: patch.privacyMask ?? null,
+        driveExportTimeoutSecs: patch.driveExportTimeoutSecs ?? null
+      });
+    } catch (err) {
+      actionError = err as UiError;
+    }
+  }
+
+  async function runToggleLocale() {
+    const next = snap?.config.locale === 'en' ? 'zh-Hans' : 'en';
+    await savePreferences({ locale: next });
+  }
+
+  async function runTogglePrivacyMask() {
+    privacyMask = !privacyMask;
+    await savePreferences({ privacyMask });
+  }
+
+  async function runExportDriveNow() {
+    exporting = true;
+    actionError = null;
+    try {
+      await invoke<DriveExportReport>('export_to_drive_now', {
+        includeOutputs: exportOutputsOnStop
+      });
+      snap = await invoke<AppSnapshot>('get_snapshot');
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      exporting = false;
+    }
+  }
+
+  async function runReopenDriveAuthUrl(url: string | null) {
+    if (!url) return;
+    try {
+      await invoke('open_external_url', { url });
+    } catch (err) {
+      actionError = err as UiError;
+    }
+  }
+
+  async function runConfirmDriveAuth() {
+    snap = await invoke<AppSnapshot>('confirm_drive_auth');
+  }
+
+  async function runRetryDriveMount() {
+    snap = await invoke<AppSnapshot>('retry_drive_mount');
+  }
+
+  async function runSkipDriveForSession() {
+    snap = await invoke<AppSnapshot>('skip_drive_for_session');
+  }
 </script>
 
+<div class="app-shell" class:masked={privacyMask}>
 <main>
   <header class="topbar">
     <div>
@@ -327,6 +510,12 @@
       </p>
     </div>
     <div class="topbar-actions">
+      <button class="secondary" onclick={runToggleLocale}>
+        {snap?.config.locale === 'en' ? '中文' : 'EN'}
+      </button>
+      <button class="secondary" onclick={runTogglePrivacyMask}>
+        {privacyMask ? '👁 ' : ''}{t('privacy_mask_label', '隐私打码')}
+      </button>
       <span class="phase-badge phase-{snap?.phase?.toLowerCase() ?? 'idle'}">
         {snap?.phase ?? 'Idle'}
       </span>
@@ -377,19 +566,27 @@
 
   <section class="grid-two">
     <div class="card">
-      <h2>环境与账号</h2>
+      <h2>{t('section_env_account', '环境与账号')}</h2>
       <dl class="kv">
         <dt>colab CLI</dt>
-        <dd class="mono">{snap?.env.colab_path ?? t('env_colab_missing', '未找到 colab')}</dd>
+        <dd class="mono sensitive">{snap?.env.colab_path ?? t('env_colab_missing', '未找到 colab')}</dd>
         <dt>OpenSSH</dt>
-        <dd>{snap?.env.ssh_available && snap?.env.ssh_keygen_available ? '可用 (/usr/bin/ssh)' : '缺失'}</dd>
+        <dd>{snap?.env.ssh_available && snap?.env.ssh_keygen_available ? t('env_ssh_available', 'ssh / ssh-keygen 可用') : t('env_ssh_missing', '未找到 /usr/bin/ssh')}</dd>
         <dt>{t('account_label', '当前账号')}</dt>
-        <dd>{snap?.account_email ?? t('account_not_signed_in', '未登录')}</dd>
+        <dd class="sensitive">{snap?.account_email ?? t('account_not_signed_in', '未登录')}</dd>
         <dt>{t('balance_label', '计算单元余额')}</dt>
         <dd>
           {#if snap?.usage}
             {snap.usage.current_balance.toFixed(2)} CU
-            （{snap.usage.usage_rate_hourly.toFixed(2)}/hr · 活跃 {snap.usage.active_assignments}）
+            （{snap.usage.usage_rate_hourly.toFixed(2)}/hr · {snap.usage.active_assignments}）
+          {:else}
+            --
+          {/if}
+        </dd>
+        <dt>{t('cu_remaining_label', '按当前速率预计可用')}</dt>
+        <dd>
+          {#if snap?.usage}
+            {formatDurationMinutes(snap?.telemetry?.estimated_remaining_minutes)}
           {:else}
             --
           {/if}
@@ -398,7 +595,7 @@
     </div>
 
     <div class="card">
-      <h2>会话与 GPU 配置</h2>
+      <h2>{t('section_session_config', '会话配置')}</h2>
       <div class="form-row">
         <label for="gpu-select">{t('gpu_label', 'GPU 规格')}</label>
         <select
@@ -424,15 +621,51 @@
           <span class="hint">{t('high_ram_l4_disabled', 'L4 仅提供单档内存，不支持 High-RAM')}</span>
         {/if}
       </div>
+      <div class="form-row checkbox-row">
+        <label>
+          <input
+            type="checkbox"
+            bind:checked={useDrive}
+            onchange={() => savePreferences({ useDrive })}
+            disabled={busy || Boolean(snap?.active_session) || Boolean(snap?.pending_session) || Boolean(snap?.ledger_corrupted)}
+          />
+          {t('use_drive_label', '使用 Google Drive 持久化（零 Token 上云）')}
+        </label>
+      </div>
+      <div class="form-row checkbox-row">
+        <label>
+          <input
+            type="checkbox"
+            bind:checked={exportOutputsOnStop}
+            onchange={() => savePreferences({ exportOutputsOnStop })}
+            disabled={stopping}
+          />
+          {t('export_outputs_label', '停机时导出 output/ 成品到 Drive')}
+        </label>
+      </div>
+      <div class="form-row">
+        <label for="export-timeout-input">{t('export_timeout_label', '停机导出超时 (秒)')}</label>
+        <input
+          id="export-timeout-input"
+          type="number"
+          min="15"
+          max="1800"
+          step="15"
+          bind:value={driveExportTimeoutSecs}
+          onchange={() => savePreferences({ driveExportTimeoutSecs })}
+          disabled={stopping}
+        />
+      </div>
       {#if snap?.active_session}
         <div class="session-meta">
-          <span>会话: <code>{snap.active_session.session_name}</code></span>
-          <span>硬件: {snap.active_session.hardware_summary}</span>
-          <span>本地代理: <code>127.0.0.1:{snap.active_session.local_port}</code></span>
+          <span>{t('session_label', '当前会话')}: <code class="sensitive">{snap.active_session.session_name}</code></span>
+          <span class="sensitive">{t('hardware_label', '硬件')}: {snap.active_session.hardware_summary}</span>
+          <span>{t('local_proxy_label', '本地代理')}: <code>127.0.0.1:{snap.active_session.local_port}</code></span>
+          <span>Drive: {snap.active_session.drive_enabled ? 'ON' : 'OFF'}</span>
         </div>
       {:else if snap?.pending_session}
         <div class="session-meta">
-          <span>待核对会话: <code>{snap.pending_session.session_name}</code></span>
+          <span>{t('pending_session_label', '待完成会话')}: <code class="sensitive">{snap.pending_session.session_name}</code></span>
           <span>GPU: {snap.pending_session.gpu}</span>
         </div>
       {/if}
@@ -454,7 +687,7 @@
       {#if snap?.phase === 'Starting'}
         <button class="danger" onclick={runCancelStart} disabled={stopping}>
           {snap?.active_session
-            ? '取消开机并立即停机'
+            ? t('btn_cancel_and_stop', '取消并停机')
             : t('btn_cancel_start', '取消开机（等待分配后停机）')}
         </button>
       {/if}
@@ -469,6 +702,11 @@
         <button class="secondary" onclick={runOpenColabUrl} disabled={stopping}>
           {t('btn_open_colab_url', '在浏览器打开 Colab 页')}
         </button>
+        {#if snap.active_session.drive_enabled && snap.tunnel_connected}
+          <button class="secondary" onclick={runExportDriveNow} disabled={exporting || stopping}>
+            {t('btn_export_drive', '立即导出到 Drive')}
+          </button>
+        {/if}
         <button class="danger" onclick={runStop} disabled={stopping}>
           {t('btn_stop', '停机并核验停止计费')}
         </button>
@@ -513,6 +751,85 @@
     {/if}
   </section>
 
+  <section class="card">
+    <div class="row-between">
+      <h2>{t('telemetry_title', '实时算力与资源监控')}</h2>
+      {#if snap?.telemetry?.gpu_name}
+        <span class="hint sensitive">{snap.telemetry.gpu_name}</span>
+      {/if}
+    </div>
+    {#if snap?.tunnel_connected && snap?.telemetry}
+      <div class="telemetry-grid">
+        <div class="metric">
+          <span class="metric-label">{t('gpu_util_label', 'GPU 利用率')}</span>
+          <strong>
+            {snap.telemetry.gpu_util_pct != null ? `${snap.telemetry.gpu_util_pct.toFixed(0)}%` : '--'}
+            {snap.telemetry.gpu_temp_c != null ? ` (${snap.telemetry.gpu_temp_c.toFixed(0)}°C)` : ''}
+          </strong>
+        </div>
+        <div class="metric">
+          <span class="metric-label">{t('vram_label', '显存 (VRAM)')}</span>
+          <strong>{formatGiB(snap.telemetry.vram_used_bytes)} / {formatGiB(snap.telemetry.vram_total_bytes)}</strong>
+        </div>
+        <div class="metric">
+          <span class="metric-label">{t('ram_label', '系统内存 (RAM)')}</span>
+          <strong>{formatGiB(snap.telemetry.ram_used_bytes)} / {formatGiB(snap.telemetry.ram_total_bytes)}</strong>
+        </div>
+        <div class="metric">
+          <span class="metric-label">{t('queue_label', '任务队列')}</span>
+          <strong>{snap.telemetry.queue_running} running / {snap.telemetry.queue_pending} pending</strong>
+        </div>
+        <div class="metric">
+          <span class="metric-label">{t('disk_content_label', '/content 剩余')}</span>
+          <strong>{formatGiB(snap.telemetry.content_free_bytes)}</strong>
+        </div>
+        <div class="metric">
+          <span class="metric-label">{t('disk_drive_label', 'Drive 剩余')}</span>
+          <strong>{formatGiB(snap.telemetry.drive_free_bytes)}</strong>
+        </div>
+      </div>
+      {#if snap.telemetry.samples.length > 0}
+        <div class="chart-wrap">
+          <svg viewBox="0 0 320 80" class="telem-svg" preserveAspectRatio="none">
+            <line x1="0" y1="40" x2="320" y2="40" stroke="currentColor" stroke-opacity="0.15" stroke-dasharray="3 3" />
+            <polyline
+              fill="none"
+              stroke="#0a84ff"
+              stroke-width="2"
+              points={svgPolyline(snap.telemetry.samples, (s) => s.gpu_util_pct)}
+            />
+            <polyline
+              fill="none"
+              stroke="#30d158"
+              stroke-width="2"
+              points={svgPolyline(snap.telemetry.samples, (s) => s.vram_pct)}
+            />
+            <polyline
+              fill="none"
+              stroke="#ff9f0a"
+              stroke-width="1.5"
+              points={svgPolyline(snap.telemetry.samples, (s) => s.ram_pct)}
+            />
+          </svg>
+          <div class="chart-legend">
+            <span style="color:#0a84ff">● GPU%</span>
+            <span style="color:#30d158">● VRAM%</span>
+            <span style="color:#ff9f0a">● RAM%</span>
+            <span class="hint">({snap.telemetry.samples.length}/120)</span>
+          </div>
+        </div>
+      {/if}
+    {:else}
+      <p class="hint">{t('telemetry_empty', '等待画布就绪后开始采集…')}</p>
+    {/if}
+  </section>
+
+  {#if snap?.last_export_report}
+    <section class="banner {snap.last_export_report.ok && snap.last_export_report.flush_ok ? 'ok' : 'warn'}">
+      <p>{snap.last_export_report.summary}</p>
+    </section>
+  {/if}
+
   {#if snap?.last_stop_report}
     <section class="banner {snap.last_stop_report.billing_verified_stopped ? 'ok' : 'warn'}">
       <strong>停机核验报告（{snap.last_stop_report.session_name}）</strong>
@@ -532,10 +849,64 @@
       {logsExpanded ? '▼' : '▶'} {t('logs_title', '运行日志（已脱敏）')} ({snap?.logs.length ?? 0})
     </button>
     {#if logsExpanded}
-      <pre class="log-box">{snap?.logs.length ? snap.logs.join('\n') : t('logs_empty', '暂无日志')}</pre>
+      <pre class="log-box sensitive">{snap?.logs.length ? snap.logs.join('\n') : t('logs_empty', '暂无日志')}</pre>
     {/if}
   </section>
 </main>
+
+{#if snap?.drive_auth}
+  <div class="modal-backdrop">
+    <div class="modal">
+      <h3>{t('drive_auth_title', '需要授权挂载 Google Drive')}</h3>
+      <p>{t('drive_auth_body', '请在浏览器完成授权后点击「我已授权，继续挂载」。')}</p>
+      {#if snap.drive_auth.auth_url}
+        <p class="mono url-preview sensitive">{snap.drive_auth.auth_url}</p>
+      {/if}
+      {#if snap.drive_auth.status === 'Failed' && snap.drive_auth.grace_deadline_unix}
+        <p class="hint">
+          {t('drive_grace_countdown', '挂载失败，{secs}s 后将自动降级为无 Drive 模式继续启动（可重试、跳过或取消并停机）')
+            .replace('{secs}', String(driveGraceRemainingSecs))}
+        </p>
+      {:else}
+        <p class="hint">
+          {t('drive_auth_countdown', '剩余等待时间：{secs}s（第 {attempt}/{max} 次）')
+            .replace('{secs}', String(driveRemainingSecs))
+            .replace('{attempt}', String(snap.drive_auth.attempt))
+            .replace('{max}', String(snap.drive_auth.max_attempts))}
+        </p>
+      {/if}
+      {#if snap.drive_auth.message}
+        <p class="banner warn">{snap.drive_auth.message}</p>
+      {/if}
+      <div class="modal-actions">
+        {#if snap.drive_auth.auth_url}
+          <button class="secondary" onclick={() => runReopenDriveAuthUrl(snap?.drive_auth?.auth_url ?? null)}>
+            {t('drive_auth_reopen', '重新打开授权页')}
+          </button>
+        {/if}
+        {#if snap.drive_auth.status !== 'Failed'}
+          <button
+            class="primary"
+            onclick={runConfirmDriveAuth}
+            disabled={snap.drive_auth.status === 'Continuing'}
+          >
+            {t('drive_auth_continue', '我已授权，继续挂载')}
+          </button>
+        {:else if snap.drive_auth.attempt < snap.drive_auth.max_attempts}
+          <button class="primary" onclick={runRetryDriveMount}>
+            {t('drive_auth_retry', '重试挂载')}
+          </button>
+        {/if}
+        <button class="secondary" onclick={runSkipDriveForSession}>
+          {t('drive_auth_skip', '跳过 Drive（本次无持久化继续）')}
+        </button>
+        <button class="danger" onclick={runCancelStart} disabled={stopping}>
+          {t('btn_cancel_and_stop', '取消并停机')}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if showZeroCuModal}
   <div class="modal-backdrop">
@@ -574,6 +945,7 @@
     </div>
   </div>
 {/if}
+</div>
 
 <style>
   :global(body) {
@@ -871,5 +1243,57 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 16px;
+  }
+
+  .telemetry-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+    margin-top: 8px;
+  }
+
+  .metric {
+    padding: 8px 10px;
+    border-radius: 7px;
+    background: light-dark(#f2f2f7, #1c1c1e);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .metric-label {
+    font-size: 11px;
+    opacity: 0.7;
+  }
+
+  .chart-wrap {
+    margin-top: 12px;
+  }
+
+  .telem-svg {
+    width: 100%;
+    height: 80px;
+    border-radius: 6px;
+    background: light-dark(#f2f2f7, #1c1c1e);
+  }
+
+  .chart-legend {
+    display: flex;
+    gap: 14px;
+    font-size: 11px;
+    margin-top: 4px;
+  }
+
+  .url-preview {
+    font-size: 11px;
+    word-break: break-all;
+    background: light-dark(#f2f2f7, #1c1c1e);
+    padding: 8px;
+    border-radius: 6px;
+  }
+
+  .app-shell.masked .sensitive {
+    filter: blur(5px);
+    user-select: none;
   }
 </style>

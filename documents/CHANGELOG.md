@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0（未发布 / unreleased）
+
+### 简体中文
+
+- 新增零 Token 上云的 Google Drive 持久化闭环（`persistence.rs`）：挂载前核对 `colab whoami`、以 `setsid()` 脱离控制终端拉起 `colab drivemount` 并提供浏览器授权引导弹窗（10 分钟倒计时、最多 2 次重试、支持跳过降级为无 Drive 模式）。
+- 开机冻结 Colab 预装核心包（`torch` / `torchvision` / `torchaudio` / `numpy` / `transformers` / `pillow` / `safetensors`）为 `/tmp/colab_constraints.txt`，所有依赖安装带 `-c` 约束；`custom_nodes_repos.txt` 锁定 `<repo_url> <commit_sha>`；目录映射拷贝先核对文件数与总字节再 `shutil.rmtree`；`--no-drive` 自动清理悬空软链与 `extra_model_paths.yaml` 并在队列为空时热重启生效。
+- 停机前与手动支持捕获 `/history` 最新 `create_time` 工作流导出并调用 `drive.flush_and_unmount()`（90s 独立超时）；导出或刷盘超时绝不阻塞 `colab stop`，并在报告中如实标记“Drive 同步未确认”。
+- 新增三级零额外 SSH 开销算力/CU 实时监控（`telemetry.rs`）：3s 本地回环读 `/system_stats` 与 `/queue`、20s 复用 `ControlMaster` 采集 `nvidia-smi` 与磁盘空间、60s 刷新 `colab usage` 并换算剩余可用时长，主界面提供 120 点 SVG 实时折线图、中英双语实时切换（`i18n.rs`）与隐私打码开关。
+
+### English
+
+- Added zero-token-upload Google Drive persistence (`persistence.rs`): verifies `colab whoami` before mount, spawns `colab drivemount` detached via `setsid()` with an interactive browser authorization modal (10-minute countdown, max 2 retries, and graceful fallback to `--no-drive` mode).
+- Froze Colab preinstalled core packages (`torch`, `torchvision`, `torchaudio`, `numpy`, `transformers`, `pillow`, `safetensors`) into `/tmp/colab_constraints.txt` for all `pip`/`uv` installs; pinned custom nodes as `<repo_url> <commit_sha>` in `custom_nodes_repos.txt`; verified file counts and byte sizes before `shutil.rmtree`; and added `--no-drive` cleanup of dangling symlinks and `extra_model_paths.yaml` with idle auto-restart.
+- Added manual and pre-stop workflow snapshot export from `/history` (latest `create_time`) with `drive.flush_and_unmount()` under a 90s timeout; failures or timeouts never block `colab stop` and honestly report unconfirmed Drive sync.
+- Added three-tier zero-extra-SSH telemetry (`telemetry.rs`): 3s local loopback `/system_stats` & `/queue`, 20s `ControlMaster`-reused `nvidia-smi` & disk space probe, and 60s `colab usage` remaining-time estimation, rendered with a 120-sample SVG chart, live Chinese/English switching (`i18n.rs`), and a privacy-mask toggle.
+
 ## 0.2.0（未发布 / unreleased）
 
 ### 简体中文

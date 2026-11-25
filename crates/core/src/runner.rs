@@ -221,7 +221,55 @@ pub fn redact_sensitive_text(input: &str) -> String {
     s = redact_session_line_endpoints(&s);
     s = redact_colab_urls(&s);
     s = redact_m_s_endpoints(&s);
+    s = redact_url_userinfo(&s);
     s
+}
+
+fn redact_url_userinfo(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut pos = 0;
+    while pos < input.len() {
+        let next_http = find_ascii_ci(input, "http://", pos);
+        let next_https = find_ascii_ci(input, "https://", pos);
+        let (idx, scheme_len) = match (next_http, next_https) {
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    (a, "http://".len())
+                } else {
+                    (b, "https://".len())
+                }
+            }
+            (Some(a), None) => (a, "http://".len()),
+            (None, Some(b)) => (b, "https://".len()),
+            (None, None) => break,
+        };
+        let auth_start = idx + scheme_len;
+        let bytes = input.as_bytes();
+        let mut end = auth_start;
+        let mut at_idx = None;
+        while end < bytes.len()
+            && !is_url_delim(bytes[end])
+            && bytes[end] != b'/'
+            && bytes[end] != b'?'
+            && bytes[end] != b'#'
+        {
+            if bytes[end] == b'@' {
+                at_idx = Some(end);
+                break;
+            }
+            end += 1;
+        }
+        if let Some(at) = at_idx {
+            out.push_str(&input[pos..auth_start]);
+            out.push_str("[REDACTED]@");
+            pos = at + 1;
+        } else {
+            out.push_str(&input[pos..auth_start]);
+            pos = auth_start;
+        }
+    }
+    out.push_str(&input[pos..]);
+    out
 }
 
 fn is_query_delim(b: u8) -> bool {
@@ -440,7 +488,8 @@ mod tests {
             "wss://8080-m-s-3x9abc123def.us-central1.colab.googleusercontent.com/colab/ssh?colab-runtime-proxy-token=tok_secret_123&colab-client-agent=colab-cli\n",
             "Authorization: Bearer ya29.a0AfH6SM_secret\n",
             "x-goog-colab-token: rt_secret_456\n",
-            "https://oauth2.googleapis.com/tokeninfo?access_token=ya29.secret_qs"
+            "https://oauth2.googleapis.com/tokeninfo?access_token=ya29.secret_qs\n",
+            "https://oauth2:ghp_secret_token_999@github.com/example/node.git"
         );
 
         let redacted = redact_sensitive_text(sample);
@@ -451,6 +500,7 @@ mod tests {
             "rt_secret_456",
             "ya29.secret_qs",
             "us-central1.colab.googleusercontent.com",
+            "ghp_secret_token_999",
         ] {
             assert!(
                 !redacted.contains(secret),
@@ -462,6 +512,7 @@ mod tests {
         assert!(redacted.contains("/tun/m/[REDACTED]"));
         assert!(redacted.contains("Bearer [REDACTED]"));
         assert!(redacted.contains("x-goog-colab-token: [REDACTED]"));
+        assert!(redacted.contains("https://[REDACTED]@github.com/example/node.git"));
     }
 
     #[test]
