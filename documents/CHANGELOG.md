@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0（未发布 / unreleased）
+
+### 简体中文
+
+- 新增 `agy-cs` 公开 CLI 多账号联动（`agy_bridge.rs`）：自动探测本机 `agy-cs` 与 `Agy Switcher.app`（未安装则优雅降级为单账号模式）；支持展示多账号 CU 余额、刷新额度与切换账号（有活跃或待核对托管会话时禁止切号防漏停）；外部切号漂移时按 `owner_email` 从 `agy-cs colab ls` 现查名字一键切回原号。
+- 新增双时钟睡眠感知本地闲置看门狗（`watchdog.rs`）：默认开启 30 分钟（支持 `15 / 30 / 60 分钟 / 关闭`）；通过单调时钟与墙上时钟比对识别 Mac 睡眠唤醒，唤醒后先重查 `/queue` 再给足完整 3 分钟停机预告（支持一键「延长 30 分钟」），不在唤醒瞬间直接停机。
+- 新增按当前消耗速率估算剩余可用 `< 15 分钟` 的低余额高危提醒，并在 `AGENTS.md` 中明确区分“退出 App 不问不停”与“本地闲置看门狗默认 30 分钟开启”。
+
+### English
+
+- Added `agy-cs` public CLI multi-account integration (`agy_bridge.rs`): detects local `agy-cs` and `Agy Switcher.app` (gracefully degrading to single-account mode when absent), displays per-account CU balances, refreshes quotas, blocks switching while a managed session is active, and supports one-click switch-back by dynamically resolving `owner_email` via `agy-cs colab ls`.
+- Added a dual-clock sleep-aware local idle watchdog (`watchdog.rs`): enabled at 30 minutes by default (`15 / 30 / 60 min / Off`); compares monotonic and wall clocks to detect macOS sleep/wake jumps, re-checks `/queue` after wake, and always provides a full 3-minute countdown warning (with a "+30 min" extend action) before stopping.
+- Added low-balance warning when estimated remaining runtime drops below 15 minutes, and documented the distinction between app-exit behavior and the 30-minute idle watchdog in `AGENTS.md`.
+
 ## 0.3.0（未发布 / unreleased）
 
 ### 简体中文

@@ -307,6 +307,77 @@ async fn update_preferences(
 }
 
 #[tauri::command]
+async fn set_watchdog_minutes(
+    state: tauri::State<'_, AppState>,
+    minutes: Option<u32>,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .set_watchdog_minutes(minutes)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn extend_watchdog(
+    state: tauri::State<'_, AppState>,
+    extra_minutes: u32,
+) -> Result<AppSnapshot, UiError> {
+    Ok(state.manager.extend_watchdog(extra_minutes).await)
+}
+
+#[tauri::command]
+async fn dismiss_watchdog_sleep_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<AppSnapshot, UiError> {
+    Ok(state.manager.dismiss_watchdog_sleep_notice().await)
+}
+
+#[tauri::command]
+async fn refresh_agy_accounts(
+    state: tauri::State<'_, AppState>,
+    refresh_quota: bool,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .refresh_agy_accounts(refresh_quota)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn switch_agy_account(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .switch_agy_account(name)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn switch_back_to_owner_account(
+    state: tauri::State<'_, AppState>,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .switch_back_to_owner_account()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn open_agy_switcher_or_guide(state: tauri::State<'_, AppState>) -> Result<String, UiError> {
+    state
+        .manager
+        .open_agy_switcher_or_guide()
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
 async fn stop_and_exit(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -393,6 +464,27 @@ pub fn run() {
                     let _ = handle.emit("snapshot-updated", snap);
                 }
             });
+            let mgr_wd = manager.clone();
+            let handle_wd = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    mgr_wd.wait_watchdog_stop_request().await;
+                    match mgr_wd.stop_session().await {
+                        Ok(report) => {
+                            if report.safe_to_clear_ledger {
+                                if let Some(canvas) = handle_wd.get_webview_window("canvas") {
+                                    let _ = canvas.close();
+                                }
+                            } else {
+                                mgr_wd.reset_watchdog_after_failed_stop().await;
+                            }
+                        }
+                        Err(_) => {
+                            mgr_wd.reset_watchdog_after_failed_stop().await;
+                        }
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -414,6 +506,13 @@ pub fn run() {
             skip_drive_for_session,
             export_to_drive_now,
             update_preferences,
+            set_watchdog_minutes,
+            extend_watchdog,
+            dismiss_watchdog_sleep_notice,
+            refresh_agy_accounts,
+            switch_agy_account,
+            switch_back_to_owner_account,
+            open_agy_switcher_or_guide,
             stop_and_exit,
             leave_running_and_exit,
         ])

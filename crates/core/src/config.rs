@@ -62,6 +62,10 @@ const fn default_drive_export_timeout_secs() -> u64 {
     90
 }
 
+const fn default_watchdog_idle_minutes() -> Option<u32> {
+    Some(30)
+}
+
 /// Non-sensitive local user configuration persisted in `<data_dir>/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -79,6 +83,8 @@ pub struct AppConfig {
     pub privacy_mask: bool,
     #[serde(default = "default_drive_export_timeout_secs")]
     pub drive_export_timeout_secs: u64,
+    #[serde(default = "default_watchdog_idle_minutes")]
+    pub watchdog_idle_minutes: Option<u32>,
 }
 
 impl Default for AppConfig {
@@ -91,6 +97,7 @@ impl Default for AppConfig {
             export_outputs_on_stop: true,
             privacy_mask: false,
             drive_export_timeout_secs: default_drive_export_timeout_secs(),
+            watchdog_idle_minutes: default_watchdog_idle_minutes(),
         }
     }
 }

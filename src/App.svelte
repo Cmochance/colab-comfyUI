@@ -18,6 +18,8 @@
     colab_path: string | null;
     ssh_available: boolean;
     ssh_keygen_available: boolean;
+    agy_cs_path: string | null;
+    agy_switcher_app_path: string | null;
   }
 
   interface UsageInfo {
@@ -121,6 +123,24 @@
     samples: TelemetrySample[];
   }
 
+  interface AgyColabAccount {
+    name: string;
+    email: string;
+    balance_cu: number | null;
+    usage_rate_hourly: number | null;
+    active_assignments: number | null;
+    is_current: boolean;
+  }
+
+  interface WatchdogSnapshot {
+    enabled: boolean;
+    threshold_minutes: number | null;
+    phase: 'Disabled' | 'Counting' | 'Warning' | 'Stopping';
+    idle_secs: number;
+    warning_remaining_secs: number | null;
+    sleep_wake_notice: boolean;
+  }
+
   interface AppSnapshot {
     phase: SessionPhase;
     step: StartStep | null;
@@ -131,12 +151,16 @@
       high_mem: boolean;
       use_drive: boolean;
       export_outputs_on_stop: boolean;
-      drive_export_timeout_secs?: number;
+      drive_export_timeout_secs: number;
+      watchdog_idle_minutes: number | null;
       privacy_mask: boolean;
     };
     account_email: string | null;
     auth_required: boolean;
     usage: UsageInfo | null;
+    agy_accounts: AgyColabAccount[];
+    account_drift_detected: boolean;
+    low_balance_warning: boolean;
     active_session: ActiveSession | null;
     pending_session: PendingSession | null;
     ledger_corrupted: boolean;
@@ -149,6 +173,7 @@
     canvas_url: string | null;
     drive_auth: DriveAuthPrompt | null;
     telemetry: TelemetrySnapshot;
+    watchdog: WatchdogSnapshot;
     last_export_report: DriveExportReport | null;
     logs: string[];
     i18n: Record<string, string>;
@@ -185,6 +210,7 @@
   let refreshing = $state(false);
   let exporting = $state(false);
   let exitBusy = $state(false);
+  let agyBusy = $state(false);
   let logsExpanded = $state(false);
   let showZeroCuModal = $state(false);
   let showExitModal = $state(false);
@@ -192,9 +218,25 @@
   let elapsedSecs = $state(0);
   let driveRemainingSecs = $state(0);
   let driveGraceRemainingSecs = $state(0);
+  let watchdogWarningSecs = $state(0);
 
-  const busy = $derived(starting || stopping || reconnecting || refreshing || exporting || exitBusy);
+  const busy = $derived(
+    starting || stopping || reconnecting || refreshing || exporting || exitBusy || agyBusy
+  );
   const t = (key: string, fallback: string) => snap?.i18n?.[key] ?? fallback;
+
+  $effect(() => {
+    const wd = snap?.watchdog;
+    if (!snap?.active_session || wd?.phase !== 'Warning' || wd.warning_remaining_secs == null) {
+      watchdogWarningSecs = 0;
+      return;
+    }
+    watchdogWarningSecs = wd.warning_remaining_secs;
+    const timer = setInterval(() => {
+      watchdogWarningSecs = Math.max(0, watchdogWarningSecs - 1);
+    }, 1000);
+    return () => clearInterval(timer);
+  });
 
   function formatGiB(bytes: number | null | undefined): string {
     if (bytes == null) return '--';
@@ -498,6 +540,79 @@
   async function runSkipDriveForSession() {
     snap = await invoke<AppSnapshot>('skip_drive_for_session');
   }
+
+  async function runSetWatchdogMinutes(val: string) {
+    const minutes = val === 'off' ? null : Number(val);
+    try {
+      snap = await invoke<AppSnapshot>('set_watchdog_minutes', { minutes });
+    } catch (err) {
+      actionError = err as UiError;
+    }
+  }
+
+  async function runExtendWatchdog() {
+    snap = await invoke<AppSnapshot>('extend_watchdog', { extraMinutes: 30 });
+  }
+
+  async function runDismissSleepNotice() {
+    snap = await invoke<AppSnapshot>('dismiss_watchdog_sleep_notice');
+  }
+
+  async function runRefreshAgyAccounts(refreshQuota: boolean) {
+    agyBusy = true;
+    try {
+      snap = await invoke<AppSnapshot>('refresh_agy_accounts', { refreshQuota });
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      agyBusy = false;
+    }
+  }
+
+  async function runSwitchAgyAccount(selectEl: HTMLSelectElement) {
+    const name = selectEl.value;
+    if (!name) return;
+    agyBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>('switch_agy_account', { name });
+    } catch (err) {
+      actionError = err as UiError;
+      const cur = snap?.agy_accounts.find((a) => a.is_current)?.name ?? '';
+      if (cur) selectEl.value = cur;
+    } finally {
+      agyBusy = false;
+    }
+  }
+
+  async function runSwitchBackToOwner() {
+    agyBusy = true;
+    try {
+      actionError = null;
+      snap = await invoke<AppSnapshot>('switch_back_to_owner_account');
+    } catch (err) {
+      actionError = err as UiError;
+    } finally {
+      agyBusy = false;
+    }
+  }
+
+  async function runOpenAgySwitcher() {
+    try {
+      const res = await invoke<string>('open_agy_switcher_or_guide');
+      if (res === 'guide_terminal') {
+        actionError = {
+          code: 'AGY_SWITCHER_NOT_FOUND',
+          message: t(
+            'agy_switcher_not_found',
+            '未检测到 Agy Switcher.app，请在终端执行 `colab whoami` 登录或安装 agy-cs。'
+          )
+        };
+      }
+    } catch (err) {
+      actionError = err as UiError;
+    }
+  }
 </script>
 
 <div class="app-shell" class:masked={privacyMask}>
@@ -534,8 +649,8 @@
 
   {#if snap?.startup_notice}
     <section class="banner info">
-      <strong>启动对账提醒</strong>
-      <p>{snap.startup_notice.message}</p>
+      <strong>{t('startup_notice_title', '启动对账提示')}</strong>
+      <p class="sensitive">{snap.startup_notice.message}</p>
     </section>
   {/if}
 
@@ -554,6 +669,39 @@
   {#if snap?.warning_banner}
     <section class="banner warn">
       <p>{snap.warning_banner}</p>
+    </section>
+  {/if}
+
+  {#if snap?.account_drift_detected}
+    <section class="banner danger">
+      <p>{t('agy_drift_banner', '检测到外部已切换账号，与当前托管会话所属账号不一致，请切回原号后再停机。')}</p>
+      {#if snap?.env.agy_cs_path}
+        <button class="secondary" onclick={runSwitchBackToOwner}>
+          {t('agy_switch_back_btn', '一键切回原号')}
+        </button>
+      {/if}
+    </section>
+  {/if}
+
+  {#if snap?.low_balance_warning}
+    <section class="banner warn">
+      <p>{t('low_balance_warning_banner', '按当前消耗速率估算剩余可用时间不足 15 分钟，请及时导出工作流与成品。')}</p>
+    </section>
+  {/if}
+
+  {#if snap?.active_session && snap?.watchdog?.phase === 'Warning'}
+    <section class="banner warn">
+      <p>
+        {t('watchdog_warning_banner', '闲置自动停机看门狗：将在 {secs}s 后自动导出并停机。').replace('{secs}', String(watchdogWarningSecs))}
+      </p>
+      <button class="primary" onclick={runExtendWatchdog}>
+        {t('watchdog_extend_btn', '延长 30 分钟')}
+      </button>
+    </section>
+  {:else if snap?.active_session && snap?.watchdog?.sleep_wake_notice}
+    <section class="banner warn">
+      <p>{t('watchdog_sleep_wake_banner', '检测到 Mac 睡眠唤醒，已重置闲置看门狗并等待重查队列。')}</p>
+      <button class="secondary" onclick={runDismissSleepNotice}>OK</button>
     </section>
   {/if}
 
@@ -592,6 +740,31 @@
           {/if}
         </dd>
       </dl>
+      {#if snap?.env.agy_cs_path && snap?.agy_accounts?.length}
+        <div class="form-row">
+          <label for="agy-account-select">{t('agy_account_switch_label', '切换 Colab 账号 (agy-cs)')}</label>
+          <select
+            id="agy-account-select"
+            class="sensitive"
+            disabled={busy || Boolean(snap?.active_session) || Boolean(snap?.pending_session) || Boolean(snap?.ledger_corrupted)}
+            onchange={(e) => runSwitchAgyAccount(e.currentTarget as HTMLSelectElement)}
+          >
+            {#each snap.agy_accounts as acc}
+              <option value={acc.name} selected={acc.is_current}>
+                {acc.name} ({acc.email}) — {acc.balance_cu != null ? `${acc.balance_cu.toFixed(2)} CU` : '--'}
+              </option>
+            {/each}
+          </select>
+        </div>
+        <div class="controls">
+          <button class="secondary" disabled={busy} onclick={() => runRefreshAgyAccounts(true)}>
+            {t('agy_refresh_quota_btn', '刷新全部额度')}
+          </button>
+          <button class="secondary" disabled={busy} onclick={runOpenAgySwitcher}>
+            {t('agy_manage_accounts_btn', '新增 / 管理账号')}
+          </button>
+        </div>
+      {/if}
     </div>
 
     <div class="card">
@@ -655,6 +828,24 @@
           onchange={() => savePreferences({ driveExportTimeoutSecs })}
           disabled={stopping}
         />
+      </div>
+      <div class="form-row">
+        <label for="watchdog-select">
+          {t('watchdog_label', '闲置自动停机看门狗')}
+          {#if snap?.active_session && snap?.watchdog?.phase === 'Counting' && snap.watchdog.idle_secs > 0}
+            <span class="hint">({Math.floor(snap.watchdog.idle_secs / 60)}m)</span>
+          {/if}
+        </label>
+        <select
+          id="watchdog-select"
+          value={snap?.config.watchdog_idle_minutes == null ? 'off' : String(snap.config.watchdog_idle_minutes)}
+          onchange={(e) => runSetWatchdogMinutes((e.currentTarget as HTMLSelectElement).value)}
+        >
+          <option value="15">{t('watchdog_minutes_option', '{mins} 分钟').replace('{mins}', '15')}</option>
+          <option value="30">{t('watchdog_minutes_option', '{mins} 分钟').replace('{mins}', '30')}</option>
+          <option value="60">{t('watchdog_minutes_option', '{mins} 分钟').replace('{mins}', '60')}</option>
+          <option value="off">{t('watchdog_off_option', '关闭')}</option>
+        </select>
       </div>
       {#if snap?.active_session}
         <div class="session-meta">
