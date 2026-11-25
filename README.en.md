@@ -17,9 +17,11 @@
 
 ## Current state
 
-Usable (**v0.3.0 Phase 2**):
+Usable (**v0.4.0 Phase 3**):
 
 - One-click launch: supports `L4` (`High-RAM` disabled), `T4`, `G4`, `A100`, and `H100`, with preflight `colab` auth and compute-unit balance checks (confirm prompt on 0 CU)
+- `agy-cs` multi-account integration & drift guard: detects local `agy-cs` and `Agy Switcher.app` (gracefully degrading to single-account mode when absent), displays per-account CU balances, blocks switching while a session is active, and supports one-click switch-back by resolving `owner_email` via `agy-cs colab ls`
+- Dual-clock sleep-aware idle watchdog: enabled at 30 minutes by default (`15 / 30 / 60 min / Off`); detects macOS sleep/wake clock jumps, re-checks `/queue` after wake, always gives a full 3-minute stop countdown (with "+30 min" extend), and warns when estimated remaining runtime drops below 15 minutes
 - Google Drive persistence (zero token upload): interactive browser OAuth prompt for `drivemount`, frozen core Colab package constraints (`-c /tmp/colab_constraints.txt`), commit-pinned `custom_nodes_repos.txt`, byte-verified directory linking, `--no-drive` symlink/YAML cleanup, and manual/pre-stop `/history` workflow export + `drive.flush_and_unmount()` (non-blocking on stop)
 - Live GPU & CU telemetry: 3s local proxy VRAM/RAM/queue polling, 20s `ControlMaster`-reused `nvidia-smi` & disk probe, 60s `colab usage` remaining-time estimate, 120-sample live chart, live Chinese/English switching, and a privacy-mask toggle
 - Zero-exposure local tunnel & dual windows: single-slot SSH `ControlMaster` + Unix socket + `127.0.0.1:18188` `Host`/`Origin`-validated reverse proxy, with zero Tauri IPC permissions on the `canvas` window
@@ -27,7 +29,6 @@ Usable (**v0.3.0 Phase 2**):
 
 Planned next:
 
-- `agy-cs` multi-account integration and sleep-aware idle watchdogs
 - Verified model/workflow catalog and automatic output gallery sync
 - On-demand vision prompt helper and fixed-port local API proxy
 

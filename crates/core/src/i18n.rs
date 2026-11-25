@@ -120,6 +120,15 @@ pub enum MsgKey {
     DriveExportOk,
     StartingElapsedHint,
     ReconnectingElapsedHint,
+    AgyAccountSwitchLabel,
+    AgyRefreshQuotaBtn,
+    AgyManageAccountsBtn,
+    AgyDriftBanner,
+    AgySwitchBackBtn,
+    WatchdogLabel,
+    WatchdogOffOption,
+    WatchdogExtendBtn,
+    LowBalanceWarningBanner,
 }
 
 impl MsgKey {
@@ -212,6 +221,15 @@ impl MsgKey {
             Self::DriveExportOk => "drive_export_ok",
             Self::StartingElapsedHint => "starting_elapsed_hint",
             Self::ReconnectingElapsedHint => "reconnecting_elapsed_hint",
+            Self::AgyAccountSwitchLabel => "agy_account_switch_label",
+            Self::AgyRefreshQuotaBtn => "agy_refresh_quota_btn",
+            Self::AgyManageAccountsBtn => "agy_manage_accounts_btn",
+            Self::AgyDriftBanner => "agy_drift_banner",
+            Self::AgySwitchBackBtn => "agy_switch_back_btn",
+            Self::WatchdogLabel => "watchdog_label",
+            Self::WatchdogOffOption => "watchdog_off_option",
+            Self::WatchdogExtendBtn => "watchdog_extend_btn",
+            Self::LowBalanceWarningBanner => "low_balance_warning_banner",
         }
     }
 
@@ -304,6 +322,15 @@ impl MsgKey {
             Self::DriveExportOk,
             Self::StartingElapsedHint,
             Self::ReconnectingElapsedHint,
+            Self::AgyAccountSwitchLabel,
+            Self::AgyRefreshQuotaBtn,
+            Self::AgyManageAccountsBtn,
+            Self::AgyDriftBanner,
+            Self::AgySwitchBackBtn,
+            Self::WatchdogLabel,
+            Self::WatchdogOffOption,
+            Self::WatchdogExtendBtn,
+            Self::LowBalanceWarningBanner,
         ]
     }
 }
@@ -399,6 +426,15 @@ pub fn t(locale: Locale, key: MsgKey) -> &'static str {
             MsgKey::DriveExportOk => "已导出工作流与节点列表到 Google Drive。",
             MsgKey::StartingElapsedHint => "正在等待云端响应，已耗时 {secs}s（Colab 容量紧张时会自动退避重试，可点取消安全停机）",
             MsgKey::ReconnectingElapsedHint => "正在重连本地 SSH 隧道，已耗时 {secs}s…",
+            MsgKey::AgyAccountSwitchLabel => "切换 Colab 账号 (agy-cs)",
+            MsgKey::AgyRefreshQuotaBtn => "刷新全部额度",
+            MsgKey::AgyManageAccountsBtn => "新增 / 管理账号",
+            MsgKey::AgyDriftBanner => "检测到外部已切换账号，与当前托管会话所属账号不一致，请切回原号后再停机。",
+            MsgKey::AgySwitchBackBtn => "一键切回原号",
+            MsgKey::WatchdogLabel => "闲置自动停机看门狗",
+            MsgKey::WatchdogOffOption => "关闭",
+            MsgKey::WatchdogExtendBtn => "延长 30 分钟",
+            MsgKey::LowBalanceWarningBanner => "按当前消耗速率估算剩余可用时间不足 15 分钟，请及时导出工作流与成品。",
         },
         Locale::En => match key {
             MsgKey::AppTitle => "Colab ComfyUI",
@@ -488,6 +524,15 @@ pub fn t(locale: Locale, key: MsgKey) -> &'static str {
             MsgKey::DriveExportOk => "Exported workflows and custom nodes list to Google Drive.",
             MsgKey::StartingElapsedHint => "Waiting for Colab response, elapsed {secs}s (auto-backing off if busy; click Cancel to safely stop)",
             MsgKey::ReconnectingElapsedHint => "Reconnecting local SSH tunnel, elapsed {secs}s...",
+            MsgKey::AgyAccountSwitchLabel => "Switch Colab Account (agy-cs)",
+            MsgKey::AgyRefreshQuotaBtn => "Refresh All Quotas",
+            MsgKey::AgyManageAccountsBtn => "Add / Manage Accounts",
+            MsgKey::AgyDriftBanner => "External account switch detected. Switch back to the session owner account before stopping.",
+            MsgKey::AgySwitchBackBtn => "Switch Back to Owner",
+            MsgKey::WatchdogLabel => "Idle Auto-Stop Watchdog",
+            MsgKey::WatchdogOffOption => "Off",
+            MsgKey::WatchdogExtendBtn => "Extend +30 min",
+            MsgKey::LowBalanceWarningBanner => "Estimated remaining runtime is under 15 minutes at the current burn rate. Export your work soon.",
         },
     }
 }

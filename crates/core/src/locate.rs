@@ -8,18 +8,22 @@ use serde::{Deserialize, Serialize};
 use crate::runner::{CommandRunner, CommandSpec};
 
 pub const COLAB_BIN: &str = "colab";
+pub const AGY_CS_BIN: &str = "agy-cs";
+pub const AGY_SWITCHER_APP_NAME: &str = "Agy Switcher.app";
 pub const SSH_BIN: &str = "/usr/bin/ssh";
 pub const SSH_KEYGEN_BIN: &str = "/usr/bin/ssh-keygen";
 pub const LSOF_BIN: &str = "/usr/sbin/lsof";
 pub const OPEN_BIN: &str = "/usr/bin/open";
 pub const SCUTIL_BIN: &str = "/usr/sbin/scutil";
 
-/// Environment readiness report for external binaries required by Phase 1.
+/// Environment readiness report for external binaries required by Phase 1-3.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvReport {
     pub colab_path: Option<String>,
     pub ssh_available: bool,
     pub ssh_keygen_available: bool,
+    pub agy_cs_path: Option<String>,
+    pub agy_switcher_app_path: Option<String>,
 }
 
 /// Returns fallback search directories for `colab` when `PATH` is minimal
@@ -33,26 +37,48 @@ pub fn fallback_dirs(home: Option<&Path>) -> Vec<PathBuf> {
 
 /// Finds `colab` using an injected `PATH` and `home` directory without reading `HOME`.
 pub fn find_colab(path_env: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
-    find_colab_in(path_env, &fallback_dirs(home))
+    find_bin_in(COLAB_BIN, path_env, &fallback_dirs(home))
+}
+
+/// Finds `agy-cs` using an injected `PATH` and `home` directory without reading `HOME`.
+pub fn find_agy_cs(path_env: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    find_bin_in(AGY_CS_BIN, path_env, &fallback_dirs(home))
+}
+
+/// Finds `Agy Switcher.app` in `/Applications` or `~/Applications`.
+pub fn find_agy_switcher_app(home: Option<&Path>) -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/Applications").join(AGY_SWITCHER_APP_NAME)];
+    if let Some(h) = home {
+        candidates.push(h.join("Applications").join(AGY_SWITCHER_APP_NAME));
+    }
+    candidates.into_iter().find(|p| p.is_dir())
 }
 
 /// Finds `colab` in `path` entries first, then in `fallback` directories.
 pub fn find_colab_in(path: Option<&OsStr>, fallback: &[PathBuf]) -> Option<PathBuf> {
+    find_bin_in(COLAB_BIN, path, fallback)
+}
+
+fn find_bin_in(bin_name: &str, path: Option<&OsStr>, fallback: &[PathBuf]) -> Option<PathBuf> {
     path.into_iter()
         .flat_map(env::split_paths)
         .chain(fallback.iter().cloned())
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(COLAB_BIN))
+        .map(|dir| dir.join(bin_name))
         .find(|candidate| is_executable(candidate))
 }
 
-/// Checks whether `colab`, `/usr/bin/ssh`, and `/usr/bin/ssh-keygen` are executable.
+/// Checks whether `colab`, `agy-cs`, `Agy Switcher.app`, `/usr/bin/ssh`, and `/usr/bin/ssh-keygen` are available.
 pub fn check_env(path_env: Option<&OsStr>, home: Option<&Path>) -> EnvReport {
     let colab_path = find_colab(path_env, home).map(|p| p.display().to_string());
+    let agy_cs_path = find_agy_cs(path_env, home).map(|p| p.display().to_string());
+    let agy_switcher_app_path = find_agy_switcher_app(home).map(|p| p.display().to_string());
     EnvReport {
         colab_path,
         ssh_available: is_executable(Path::new(SSH_BIN)),
         ssh_keygen_available: is_executable(Path::new(SSH_KEYGEN_BIN)),
+        agy_cs_path,
+        agy_switcher_app_path,
     }
 }
 

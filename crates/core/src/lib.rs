@@ -1,3 +1,4 @@
+pub mod agy_bridge;
 pub mod bootstrap;
 pub mod colab_cli;
 pub mod config;
@@ -8,6 +9,7 @@ pub mod persistence;
 pub mod runner;
 pub mod ssh_tunnel;
 pub mod telemetry;
+pub mod watchdog;
 pub mod webview_policy;
 
 pub use locate::find_colab;
@@ -26,6 +28,10 @@ use thiserror::Error;
 use tokio::sync::{watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 
+use crate::agy_bridge::{
+    find_account_name_by_email, list_agy_colab_accounts, open_agy_switcher_app,
+    refresh_agy_colab_quota, switch_agy_colab_account, AgyColabAccount,
+};
 use crate::bootstrap::{run_remote_bootstrap, BootstrapOutcome};
 use crate::colab_cli::{SessionEntry, SessionStatusLookup, StopReport, UsageInfo};
 use crate::config::{
@@ -55,6 +61,7 @@ use crate::telemetry::{
     parse_comfy_system_stats, push_telemetry_sample, TelemetrySample, TelemetrySnapshot,
     TELEMETRY_LOCAL_INTERVAL,
 };
+use crate::watchdog::{Clock, SystemClock, WatchdogSnapshot, WatchdogState};
 
 const MAX_LOG_LINES: usize = 300;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -152,6 +159,12 @@ pub enum CoreError {
 
     #[error("序列化错误（{context}）：{detail}")]
     Serialization { context: String, detail: String },
+
+    #[error("参数无效：{detail}")]
+    InvalidInput { detail: String },
+
+    #[error("当前存在托管会话（{session_name}），请先停机再切换账号")]
+    SwitchBlockedWhileSessionActive { session_name: String },
 }
 
 impl CoreError {
@@ -180,6 +193,8 @@ impl CoreError {
             Self::StartInProgress => "START_IN_PROGRESS",
             Self::Io { .. } => "IO_ERROR",
             Self::Serialization { .. } => "SERIALIZATION_ERROR",
+            Self::InvalidInput { .. } => "INVALID_INPUT",
+            Self::SwitchBlockedWhileSessionActive { .. } => "SWITCH_BLOCKED_ACTIVE_SESSION",
         }
     }
 
@@ -244,6 +259,9 @@ pub struct AppSnapshot {
     pub account_email: Option<String>,
     pub auth_required: bool,
     pub usage: Option<UsageInfo>,
+    pub agy_accounts: Vec<AgyColabAccount>,
+    pub account_drift_detected: bool,
+    pub low_balance_warning: bool,
     pub active_session: Option<ActiveSession>,
     pub pending_session: Option<PendingSession>,
     pub ledger_corrupted: bool,
@@ -256,6 +274,7 @@ pub struct AppSnapshot {
     pub canvas_url: Option<String>,
     pub drive_auth: Option<DriveAuthPrompt>,
     pub telemetry: TelemetrySnapshot,
+    pub watchdog: WatchdogSnapshot,
     pub last_export_report: Option<DriveExportReport>,
     pub logs: Vec<String>,
     pub i18n: BTreeMap<String, String>,
@@ -286,6 +305,9 @@ struct InnerState {
     account_email: Option<String>,
     auth_required: bool,
     usage: Option<UsageInfo>,
+    agy_accounts: Vec<AgyColabAccount>,
+    account_drift_detected: bool,
+    low_balance_warning: bool,
     active_session: Option<ActiveSession>,
     pending_session: Option<PendingSession>,
     ledger_corrupted: bool,
@@ -297,6 +319,7 @@ struct InnerState {
     tunnel_connected: bool,
     drive_auth: Option<DriveAuthPrompt>,
     telemetry: TelemetrySnapshot,
+    watchdog: WatchdogSnapshot,
     last_export_report: Option<DriveExportReport>,
     has_managed_session: Arc<AtomicBool>,
 }
@@ -434,6 +457,9 @@ pub struct SessionManager {
     intentional_stop: Arc<AtomicBool>,
     has_managed_session: Arc<AtomicBool>,
     snapshot_tx: watch::Sender<u64>,
+    clock: Arc<dyn Clock>,
+    watchdog_state: Arc<StdMutex<WatchdogState>>,
+    watchdog_stop_notify: Arc<Notify>,
 }
 
 impl SessionManager {
@@ -469,6 +495,13 @@ impl SessionManager {
         let has_managed_session = Arc::new(AtomicBool::new(
             ledgers.active.is_some() || ledgers.pending.is_some() || ledger_corrupted,
         ));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let wd_state = WatchdogState::new(
+            config.watchdog_idle_minutes,
+            clock.now_monotonic(),
+            clock.now_wall(),
+        );
+        let wd_snap = wd_state.snapshot(clock.now_monotonic());
         let env = check_env(path_env.as_deref(), home_dir.as_deref());
         let (snapshot_tx, _) = watch::channel(0u64);
         let (cancel_tx, _) = watch::channel(false);
@@ -486,6 +519,9 @@ impl SessionManager {
             account_email: None,
             auth_required: false,
             usage: None,
+            agy_accounts: Vec::new(),
+            account_drift_detected: false,
+            low_balance_warning: false,
             active_session: ledgers.active,
             pending_session: ledgers.pending,
             ledger_corrupted,
@@ -505,6 +541,7 @@ impl SessionManager {
             tunnel_connected: false,
             drive_auth: None,
             telemetry: TelemetrySnapshot::default(),
+            watchdog: wd_snap,
             last_export_report: None,
             has_managed_session: has_managed_session.clone(),
         };
@@ -531,7 +568,21 @@ impl SessionManager {
             intentional_stop: Arc::new(AtomicBool::new(false)),
             has_managed_session,
             snapshot_tx,
+            clock,
+            watchdog_state: Arc::new(StdMutex::new(wd_state)),
+            watchdog_stop_notify: Arc::new(Notify::new()),
         }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        let now_mono = clock.now_monotonic();
+        let now_wall = clock.now_wall();
+        if let (Ok(mut wd), Ok(mut guard)) = (self.watchdog_state.lock(), self.state.try_lock()) {
+            *wd = WatchdogState::new(guard.config.watchdog_idle_minutes, now_mono, now_wall);
+            guard.watchdog = wd.snapshot(now_mono);
+        }
+        self.clock = clock;
+        self
     }
 
     pub fn with_drivemount_spawner(mut self, spawner: Arc<dyn DrivemountSpawner>) -> Self {
@@ -618,6 +669,9 @@ impl SessionManager {
             account_email: s.account_email.clone(),
             auth_required: s.auth_required,
             usage: s.usage.clone(),
+            agy_accounts: s.agy_accounts.clone(),
+            account_drift_detected: s.account_drift_detected,
+            low_balance_warning: s.low_balance_warning,
             active_session: s.active_session.clone(),
             pending_session: s.pending_session.clone(),
             ledger_corrupted: s.ledger_corrupted,
@@ -630,6 +684,7 @@ impl SessionManager {
             canvas_url,
             drive_auth: s.drive_auth.clone(),
             telemetry: s.telemetry.clone(),
+            watchdog: s.watchdog.clone(),
             last_export_report: s.last_export_report.clone(),
             logs,
             i18n: table,
@@ -665,6 +720,203 @@ impl SessionManager {
         }
         self.notify_snapshot();
         Ok(self.snapshot().await)
+    }
+
+    pub async fn set_watchdog_minutes(
+        &self,
+        minutes: Option<u32>,
+    ) -> Result<AppSnapshot, CoreError> {
+        let now_mono = self.clock.now_monotonic();
+        let now_wall = self.clock.now_wall();
+        let normalized = minutes.map(|m| m.clamp(1, 240));
+        let wd_snap = {
+            let mut wd = self.watchdog_state.lock().unwrap();
+            wd.set_threshold(normalized, now_mono, now_wall);
+            wd.snapshot(now_mono)
+        };
+        {
+            let mut guard = self.state.lock().await;
+            guard.config.watchdog_idle_minutes = normalized;
+            guard.watchdog = wd_snap;
+            save_json_0600(&config_path(&self.data_dir), &guard.config)?;
+        }
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn extend_watchdog(&self, extra_minutes: u32) -> AppSnapshot {
+        let now_mono = self.clock.now_monotonic();
+        let now_wall = self.clock.now_wall();
+        let wd_snap = {
+            let mut wd = self.watchdog_state.lock().unwrap();
+            wd.extend(extra_minutes.clamp(1, 240), now_mono, now_wall);
+            wd.snapshot(now_mono)
+        };
+        {
+            let mut guard = self.state.lock().await;
+            guard.watchdog = wd_snap;
+        }
+        self.push_log(format!("已将本地闲置看门狗延长 {extra_minutes} 分钟。"))
+            .await;
+        self.notify_snapshot();
+        self.snapshot().await
+    }
+
+    pub async fn dismiss_watchdog_sleep_notice(&self) -> AppSnapshot {
+        let now_mono = self.clock.now_monotonic();
+        let wd_snap = {
+            let mut wd = self.watchdog_state.lock().unwrap();
+            wd.dismiss_sleep_notice();
+            wd.snapshot(now_mono)
+        };
+        {
+            let mut guard = self.state.lock().await;
+            guard.watchdog = wd_snap;
+        }
+        self.notify_snapshot();
+        self.snapshot().await
+    }
+
+    pub async fn wait_watchdog_stop_request(&self) {
+        self.watchdog_stop_notify.notified().await;
+    }
+
+    pub async fn step_watchdog_once(&self) -> Result<bool, CoreError> {
+        let (tunnel_connected, queue_idle) = {
+            let guard = self.state.lock().await;
+            (
+                guard.tunnel_connected,
+                guard.telemetry.queue_running == 0 && guard.telemetry.queue_pending == 0,
+            )
+        };
+        if !tunnel_connected {
+            return Ok(false);
+        }
+        let now_mono = self.clock.now_monotonic();
+        let now_wall = self.clock.now_wall();
+        let (outcome, wd_snap) = {
+            let mut wd = self.watchdog_state.lock().unwrap();
+            let outcome = wd.tick(queue_idle, now_mono, now_wall);
+            (outcome, wd.snapshot(now_mono))
+        };
+        {
+            let mut guard = self.state.lock().await;
+            guard.watchdog = wd_snap;
+        }
+        if outcome.sleep_wake_detected {
+            self.push_log("检测到 Mac 睡眠唤醒，已重置看门狗并等待重查队列。".to_string())
+                .await;
+        }
+        if outcome.entered_warning {
+            self.push_log(
+                "本地闲置看门狗进入 3 分钟停机预告（可点击「延长 30 分钟」取消本次自动停机）。"
+                    .to_string(),
+            )
+            .await;
+        }
+        self.notify_snapshot();
+        if outcome.trigger_stop {
+            self.stop_session_inner().await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub async fn refresh_agy_accounts(
+        &self,
+        refresh_quota: bool,
+    ) -> Result<AppSnapshot, CoreError> {
+        let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
+        let Some(agy_bin) = env.agy_cs_path.as_deref().map(PathBuf::from) else {
+            return Ok(self.snapshot().await);
+        };
+        let accounts = if refresh_quota {
+            let proxy_envs = self.resolve_colab_envs().await;
+            refresh_agy_colab_quota(&agy_bin, &proxy_envs, self.runner.as_ref()).await?
+        } else {
+            list_agy_colab_accounts(&agy_bin, self.runner.as_ref()).await?
+        };
+        {
+            let mut guard = self.state.lock().await;
+            guard.agy_accounts = accounts;
+        }
+        self.notify_snapshot();
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn switch_agy_account(&self, name: String) -> Result<AppSnapshot, CoreError> {
+        {
+            let guard = self.state.lock().await;
+            if let Some(ref act) = guard.active_session {
+                return Err(CoreError::SwitchBlockedWhileSessionActive {
+                    session_name: act.session_name.clone(),
+                });
+            }
+            if let Some(ref pend) = guard.pending_session {
+                return Err(CoreError::SwitchBlockedWhileSessionActive {
+                    session_name: pend.session_name.clone(),
+                });
+            }
+        }
+        let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
+        let agy_bin = env
+            .agy_cs_path
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| CoreError::MissingBinary {
+                name: "agy-cs".to_string(),
+            })?;
+        switch_agy_colab_account(&agy_bin, &name, self.runner.as_ref()).await?;
+        let _ = self.refresh_agy_accounts(false).await;
+        Ok(self.refresh_status().await)
+    }
+
+    pub async fn switch_back_to_owner_account(&self) -> Result<AppSnapshot, CoreError> {
+        let owner_email = {
+            let guard = self.state.lock().await;
+            guard
+                .active_session
+                .as_ref()
+                .map(|a| a.owner_email.clone())
+                .or_else(|| {
+                    guard
+                        .pending_session
+                        .as_ref()
+                        .map(|p| p.owner_email.clone())
+                })
+        }
+        .ok_or_else(|| CoreError::SessionLedgerMismatch {
+            detail: "当前没有需要切回的原会话账号".to_string(),
+        })?;
+        let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
+        let agy_bin = env
+            .agy_cs_path
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| CoreError::MissingBinary {
+                name: "agy-cs".to_string(),
+            })?;
+        let accounts = list_agy_colab_accounts(&agy_bin, self.runner.as_ref()).await?;
+        let target_name = find_account_name_by_email(&accounts, &owner_email)
+            .ok_or_else(|| CoreError::AccountMismatch {
+                expected_email: owner_email.clone(),
+                actual_email: "未在 agy-cs colab ls 中找到该邮箱".to_string(),
+            })?
+            .to_string();
+        switch_agy_colab_account(&agy_bin, &target_name, self.runner.as_ref()).await?;
+        self.push_log(format!("已通过 agy-cs 切回原会话账号 {target_name}。"))
+            .await;
+        let _ = self.refresh_agy_accounts(false).await;
+        Ok(self.refresh_status().await)
+    }
+
+    pub async fn open_agy_switcher_or_guide(&self) -> Result<String, CoreError> {
+        let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
+        if let Some(app_path) = env.agy_switcher_app_path {
+            open_agy_switcher_app(Path::new(&app_path), self.runner.as_ref()).await?;
+            return Ok("opened_app".to_string());
+        }
+        Ok("guide_terminal".to_string())
     }
 
     pub async fn confirm_drive_auth(&self) -> AppSnapshot {
@@ -1124,10 +1376,19 @@ impl SessionManager {
 
         let mut guard = self.state.lock().await;
         guard.account_email = Some(email.clone());
+        guard.account_drift_detected = guard
+            .active_session
+            .as_ref()
+            .is_some_and(|a| !a.owner_email.eq_ignore_ascii_case(&email))
+            || guard
+                .pending_session
+                .as_ref()
+                .is_some_and(|p| !p.owner_email.eq_ignore_ascii_case(&email));
         match usage_res {
             Ok(u) => {
-                guard.telemetry.estimated_remaining_minutes =
-                    estimated_remaining_minutes(u.current_balance, u.usage_rate_hourly);
+                let rem = estimated_remaining_minutes(u.current_balance, u.usage_rate_hourly);
+                guard.telemetry.estimated_remaining_minutes = rem;
+                guard.low_balance_warning = rem.is_some_and(|m| m < 15);
                 guard.usage = Some(u);
             }
             Err(err) => {
@@ -1149,6 +1410,16 @@ impl SessionManager {
                 None
             }
         };
+        let agy_bin_opt = guard.env.agy_cs_path.clone();
+        drop(guard);
+        if let Some(agy_bin) = agy_bin_opt {
+            if let Ok(accounts) =
+                list_agy_colab_accounts(Path::new(&agy_bin), self.runner.as_ref()).await
+            {
+                let mut guard = self.state.lock().await;
+                guard.agy_accounts = accounts;
+            }
+        }
         Ok((email, verified_orphan_count))
     }
 
@@ -2353,6 +2624,16 @@ impl SessionManager {
         let handles = self.handles.clone();
         let intentional_stop = self.intentional_stop.clone();
         let snapshot_tx = self.snapshot_tx.clone();
+        let clock = self.clock.clone();
+        let watchdog_state = self.watchdog_state.clone();
+        let watchdog_stop_notify = self.watchdog_stop_notify.clone();
+
+        {
+            let now_mono = clock.now_monotonic();
+            let now_wall = clock.now_wall();
+            let mut wd = watchdog_state.lock().unwrap();
+            wd.reset_for_new_session(now_mono, now_wall);
+        }
 
         let task = tokio::spawn(async move {
             let mut tick: u64 = 0;
@@ -2438,11 +2719,33 @@ impl SessionManager {
                             colab_cli::usage(runner.as_ref(), &colab_bin, &proxy_envs, None).await
                         {
                             let mut guard = state.lock().await;
-                            guard.telemetry.estimated_remaining_minutes =
+                            let rem =
                                 estimated_remaining_minutes(u.current_balance, u.usage_rate_hourly);
+                            guard.telemetry.estimated_remaining_minutes = rem;
+                            guard.low_balance_warning = rem.is_some_and(|m| m < 15);
                             guard.usage = Some(u);
                         }
                     }
+                }
+
+                // Dual-clock sleep-aware local idle watchdog
+                let queue_idle = {
+                    let guard = state.lock().await;
+                    guard.telemetry.queue_running == 0 && guard.telemetry.queue_pending == 0
+                };
+                let now_mono = clock.now_monotonic();
+                let now_wall = clock.now_wall();
+                let (wd_outcome, wd_snap) = {
+                    let mut wd = watchdog_state.lock().unwrap();
+                    let outcome = wd.tick(queue_idle, now_mono, now_wall);
+                    (outcome, wd.snapshot(now_mono))
+                };
+                {
+                    let mut guard = state.lock().await;
+                    guard.watchdog = wd_snap;
+                }
+                if wd_outcome.trigger_stop {
+                    watchdog_stop_notify.notify_one();
                 }
 
                 {
@@ -4836,6 +5139,197 @@ mod tests {
             mgr.teardown_local_handles().await;
             let stop_rep = mgr.stop_session().await.unwrap();
             assert_eq!(stop_rep.drive_sync_confirmed, Some(false));
+        });
+    }
+
+    struct MockClock {
+        mono_secs: StdMutex<u64>,
+        wall_secs: StdMutex<u64>,
+        base_mono: std::time::Instant,
+    }
+
+    impl MockClock {
+        fn new(wall_secs: u64) -> Self {
+            Self {
+                mono_secs: StdMutex::new(0),
+                wall_secs: StdMutex::new(wall_secs),
+                base_mono: std::time::Instant::now(),
+            }
+        }
+        fn advance(&self, mono_delta: u64, wall_delta: u64) {
+            *self.mono_secs.lock().unwrap() += mono_delta;
+            *self.wall_secs.lock().unwrap() += wall_delta;
+        }
+    }
+
+    impl Clock for MockClock {
+        fn now_monotonic(&self) -> std::time::Instant {
+            self.base_mono + Duration::from_secs(*self.mono_secs.lock().unwrap())
+        }
+        fn now_wall(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(*self.wall_secs.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn agy_switch_blocked_during_active_session_drift_switch_back_and_sleep_watchdog() {
+        let tmp = ShortTempDir::new();
+        let data = tmp.0.join("d");
+        let home = tmp.0.join("h");
+        install_fake_colab(&home);
+        let agy_bin = home.join(".local/bin/agy-cs");
+        fs::write(&agy_bin, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&agy_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let sname = default_session_name_for_email("alice@example.com");
+        let drifted = Arc::new(AtomicBool::new(false));
+        let drifted_flag = drifted.clone();
+        let switch_target = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let switch_log = switch_target.clone();
+
+        let runner: Arc<dyn CommandRunner> = Arc::new(SmartRunner {
+            responder: Box::new(move |spec| {
+                let sname = sname.clone();
+                let drifted_flag = drifted_flag.clone();
+                let switch_log = switch_log.clone();
+                let prog = spec.program.clone();
+                let args = spec.args.clone();
+                Box::pin(async move {
+                    if prog == Path::new(crate::locate::SCUTIL_BIN)
+                        || prog == Path::new(crate::locate::SSH_KEYGEN_BIN)
+                    {
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    if prog.file_name().and_then(|n| n.to_str()) == Some("agy-cs") {
+                        if args.get(1).map(String::as_str) == Some("ls") {
+                            let ls = "\
+  alice_alias  alice@example.com  120.00 CU  0.00/hr  0 active\n\
+* bob_alias    bob@example.com    40.00 CU   0.00/hr  0 active\n";
+                            return Ok(CommandOutput::from_raw(
+                                Some(0),
+                                ls.to_string(),
+                                String::new(),
+                            ));
+                        }
+                        if args.get(1).map(String::as_str) == Some("switch") {
+                            let name = args.get(2).cloned().unwrap_or_default();
+                            switch_log.lock().unwrap().push(name);
+                            drifted_flag.store(false, Ordering::SeqCst);
+                            return Ok(CommandOutput::from_raw(
+                                Some(0),
+                                String::new(),
+                                String::new(),
+                            ));
+                        }
+                    }
+                    if prog == Path::new(crate::locate::SSH_BIN) {
+                        if args.iter().any(|a| a == "bash -s") {
+                            return Ok(CommandOutput::from_raw(
+                                Some(0),
+                                format!("{}\n", crate::bootstrap::COMFY_READY_SENTINEL),
+                                String::new(),
+                            ));
+                        }
+                        return Ok(CommandOutput::from_raw(
+                            Some(0),
+                            String::new(),
+                            String::new(),
+                        ));
+                    }
+                    let sub = args
+                        .iter()
+                        .find(|a| !a.starts_with('-'))
+                        .map(String::as_str);
+                    let out = match sub {
+                        Some("whoami") => {
+                            if drifted_flag.load(Ordering::SeqCst) {
+                                "Email: bob@example.com\n".to_string()
+                            } else {
+                                "Email: alice@example.com\n".to_string()
+                            }
+                        }
+                        Some("usage") => {
+                            "Current balance: 10.00 compute units\nUsage rate: 0.00/hr\nActive assignments: 0"
+                                .to_string()
+                        }
+                        Some("status") => format!(
+                            "[{sname}] m-s-wd1 | Hardware: NVIDIA T4 | Shape: Standard | Variant: GPU"
+                        ),
+                        Some("sessions") => "[colab] No active sessions found on server.".to_string(),
+                        Some("stop") => "[colab] Session terminated.".to_string(),
+                        _ => String::new(),
+                    };
+                    Ok(CommandOutput::from_raw(Some(0), out, String::new()))
+                })
+            }),
+        });
+
+        let clock = Arc::new(MockClock::new(1_700_000_000));
+        let mgr = Arc::new(
+            SessionManager::with_deps(
+                data.clone(),
+                Some(home),
+                Some(OsString::from("/usr/bin:/bin")),
+                0,
+                runner,
+                Arc::new(MockSpawner),
+            )
+            .with_clock(clock.clone()),
+        );
+        fs::write(crate::config::ssh_key_path(&data), "priv").unwrap();
+        fs::write(crate::config::ssh_pub_key_path(&data), "pub").unwrap();
+
+        block_on(async {
+            let _ = mgr
+                .update_preferences(None, Some(false), None, None, None)
+                .await
+                .unwrap();
+            let snap = mgr.start_session(GpuTier::T4, false, false).await.unwrap();
+            assert_eq!(snap.phase, SessionPhase::Ready);
+
+            // Running session blocks manual account switch
+            let blocked = mgr
+                .switch_agy_account("bob_alias".to_string())
+                .await
+                .unwrap_err();
+            assert_eq!(blocked.code(), "SWITCH_BLOCKED_ACTIVE_SESSION");
+
+            // External switch drift detected -> switch_back_to_owner_account looks up `alice_alias` dynamically
+            drifted.store(true, Ordering::SeqCst);
+            let drifted_snap = mgr.refresh_status().await;
+            assert!(drifted_snap.account_drift_detected);
+            let back_snap = mgr.switch_back_to_owner_account().await.unwrap();
+            assert!(!back_snap.account_drift_detected);
+            assert_eq!(
+                *switch_target.lock().unwrap(),
+                vec!["alice_alias".to_string()]
+            );
+
+            // Dual-clock watchdog: 30m idle -> Warning (180s) -> sleep jump 2h -> full 180s warning again -> +180s stops
+            clock.advance(1800, 1800);
+            assert!(!mgr.step_watchdog_once().await.unwrap());
+            assert_eq!(
+                mgr.snapshot().await.watchdog.phase,
+                crate::watchdog::WatchdogPhase::Warning
+            );
+            clock.advance(10, 7200);
+            assert!(!mgr.step_watchdog_once().await.unwrap());
+            assert!(mgr.snapshot().await.watchdog.sleep_wake_notice);
+            assert_eq!(
+                mgr.snapshot().await.watchdog.warning_remaining_secs,
+                Some(180)
+            );
+            clock.advance(180, 180);
+            assert!(mgr.step_watchdog_once().await.unwrap());
+            assert!(mgr.snapshot().await.active_session.is_none());
         });
     }
 }
