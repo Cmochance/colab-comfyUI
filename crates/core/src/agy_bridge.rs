@@ -121,7 +121,7 @@ pub async fn refresh_agy_colab_quota(
     agy_cs_bin: &Path,
     proxy_envs: &[(String, String)],
     runner: &dyn CommandRunner,
-) -> Result<Vec<AgyColabAccount>, CoreError> {
+) -> Result<(Vec<AgyColabAccount>, Option<String>), CoreError> {
     let mut spec = CommandSpec::new(
         agy_cs_bin.display().to_string(),
         vec![
@@ -133,18 +133,23 @@ pub async fn refresh_agy_colab_quota(
     );
     spec.envs = proxy_envs.to_vec();
     let out = runner.run(spec, None).await?;
+    let accounts = parse_agy_colab_ls(&out.stdout_raw);
     if out.exit_code != Some(0) {
+        let detail = if out.stderr.is_empty() {
+            out.stdout.clone()
+        } else {
+            out.stderr.clone()
+        };
+        if !accounts.is_empty() {
+            return Ok((accounts, Some(detail)));
+        }
         return Err(CoreError::CommandFailed {
             command: "agy-cs colab refresh quota".to_string(),
             exit_code: out.exit_code,
-            stderr: if out.stderr.is_empty() {
-                out.stdout
-            } else {
-                out.stderr
-            },
+            stderr: detail,
         });
     }
-    Ok(parse_agy_colab_ls(&out.stdout_raw))
+    Ok((accounts, None))
 }
 
 pub async fn switch_agy_colab_account(
@@ -163,6 +168,7 @@ pub async fn switch_agy_colab_account(
         vec![
             "colab".to_string(),
             "switch".to_string(),
+            "--".to_string(),
             trimmed.to_string(),
         ],
         AGY_SWITCH_TIMEOUT,
@@ -170,7 +176,7 @@ pub async fn switch_agy_colab_account(
     let out = runner.run(spec, None).await?;
     if out.exit_code != Some(0) {
         return Err(CoreError::CommandFailed {
-            command: format!("agy-cs colab switch {trimmed}"),
+            command: format!("agy-cs colab switch -- {trimmed}"),
             exit_code: out.exit_code,
             stderr: if out.stderr.is_empty() {
                 out.stdout
@@ -232,6 +238,70 @@ mod tests {
         assert_eq!(
             find_account_name_by_email(&accounts, "unknown@gmail.com"),
             None
+        );
+    }
+
+    #[test]
+    fn refresh_quota_preserves_valid_accounts_on_partial_failure_and_switch_uses_double_dash() {
+        use crate::runner::{CommandOutput, LineCallback};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+
+        struct PartialRunner {
+            seen_args: Mutex<Vec<Vec<String>>>,
+        }
+        impl CommandRunner for PartialRunner {
+            fn run<'a>(
+                &'a self,
+                spec: CommandSpec,
+                _on_line: Option<LineCallback>,
+            ) -> Pin<Box<dyn Future<Output = Result<CommandOutput, CoreError>> + Send + 'a>>
+            {
+                self.seen_args.lock().unwrap().push(spec.args.clone());
+                Box::pin(async move {
+                    if spec.args.get(1).map(String::as_str) == Some("refresh") {
+                        return Ok(CommandOutput::from_raw(
+                            Some(1),
+                            "* alice  alice@example.com  100.00 CU  0.00/hr  0 active\n"
+                                .to_string(),
+                            "failed to refresh stale_acc".to_string(),
+                        ));
+                    }
+                    Ok(CommandOutput::from_raw(
+                        Some(0),
+                        String::new(),
+                        String::new(),
+                    ))
+                })
+            }
+        }
+
+        let runner = PartialRunner {
+            seen_args: Mutex::new(Vec::new()),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (accounts, warn) = rt
+            .block_on(refresh_agy_colab_quota(
+                Path::new("/usr/local/bin/agy-cs"),
+                &[],
+                &runner,
+            ))
+            .unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(warn.unwrap().contains("stale_acc"));
+
+        rt.block_on(switch_agy_colab_account(
+            Path::new("/usr/local/bin/agy-cs"),
+            "add",
+            &runner,
+        ))
+        .unwrap();
+        assert_eq!(
+            runner.seen_args.lock().unwrap()[1],
+            vec!["colab", "switch", "--", "add"]
         );
     }
 }

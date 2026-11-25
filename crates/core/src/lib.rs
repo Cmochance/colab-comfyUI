@@ -460,6 +460,8 @@ pub struct SessionManager {
     clock: Arc<dyn Clock>,
     watchdog_state: Arc<StdMutex<WatchdogState>>,
     watchdog_stop_notify: Arc<Notify>,
+    account_switch_in_flight: Arc<AtomicBool>,
+    low_balance_notified: Arc<AtomicBool>,
 }
 
 impl SessionManager {
@@ -571,13 +573,18 @@ impl SessionManager {
             clock,
             watchdog_state: Arc::new(StdMutex::new(wd_state)),
             watchdog_stop_notify: Arc::new(Notify::new()),
+            account_switch_in_flight: Arc::new(AtomicBool::new(false)),
+            low_balance_notified: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         let now_mono = clock.now_monotonic();
         let now_wall = clock.now_wall();
-        if let (Ok(mut wd), Ok(mut guard)) = (self.watchdog_state.lock(), self.state.try_lock()) {
+        if let (Ok(mut wd), Some(state_mut)) =
+            (self.watchdog_state.lock(), Arc::get_mut(&mut self.state))
+        {
+            let guard = state_mut.get_mut();
             *wd = WatchdogState::new(guard.config.watchdog_idle_minutes, now_mono, now_wall);
             guard.watchdog = wd.snapshot(now_mono);
         }
@@ -781,39 +788,103 @@ impl SessionManager {
         self.watchdog_stop_notify.notified().await;
     }
 
-    pub async fn step_watchdog_once(&self) -> Result<bool, CoreError> {
-        let (tunnel_connected, queue_idle) = {
-            let guard = self.state.lock().await;
-            (
-                guard.tunnel_connected,
-                guard.telemetry.queue_running == 0 && guard.telemetry.queue_pending == 0,
-            )
-        };
-        if !tunnel_connected {
-            return Ok(false);
-        }
+    pub async fn reset_watchdog_after_failed_stop(&self) {
         let now_mono = self.clock.now_monotonic();
         let now_wall = self.clock.now_wall();
-        let (outcome, wd_snap) = {
+        let wd_snap = {
             let mut wd = self.watchdog_state.lock().unwrap();
-            let outcome = wd.tick(queue_idle, now_mono, now_wall);
-            (outcome, wd.snapshot(now_mono))
+            wd.reset_after_failed_stop(now_mono, now_wall);
+            wd.snapshot(now_mono)
         };
         {
             let mut guard = self.state.lock().await;
             guard.watchdog = wd_snap;
         }
-        if outcome.sleep_wake_detected {
-            self.push_log("检测到 Mac 睡眠唤醒，已重置看门狗并等待重查队列。".to_string())
+        self.notify_snapshot();
+    }
+
+    pub async fn step_watchdog_once(&self) -> Result<bool, CoreError> {
+        self.step_watchdog_with_probe(None).await
+    }
+
+    pub async fn step_watchdog_with_probe(
+        &self,
+        override_queue_idle: Option<Option<bool>>,
+    ) -> Result<bool, CoreError> {
+        let (tunnel_connected, active_opt) = {
+            let guard = self.state.lock().await;
+            (guard.tunnel_connected, guard.active_session.clone())
+        };
+        if !tunnel_connected {
+            return Ok(false);
+        }
+        let queue_idle = match override_queue_idle {
+            Some(v) => v,
+            None => {
+                if self.local_proxy_port != 0 {
+                    match fetch_local_comfy_json(self.local_proxy_port, "/queue").await {
+                        Ok(body) => parse_comfy_queue(&body).ok().map(|(r, p)| r == 0 && p == 0),
+                        Err(_) => None,
+                    }
+                } else {
+                    let guard = self.state.lock().await;
+                    Some(guard.telemetry.queue_running == 0 && guard.telemetry.queue_pending == 0)
+                }
+            }
+        };
+
+        let mut outcome = advance_watchdog_tick(
+            &self.clock,
+            &self.watchdog_state,
+            &self.state,
+            &self.logs,
+            &self.data_dir,
+            self.runner.as_ref(),
+            queue_idle,
+        )
+        .await;
+
+        if outcome.needs_wake_verify {
+            if let Some(ref active) = active_opt {
+                let verified = verify_wake_triple_gate(
+                    self.runner.as_ref(),
+                    self.home_dir.as_deref(),
+                    self.path_env.as_deref(),
+                    self.proxy_http_hint.as_deref(),
+                    self.proxy_https_hint.as_deref(),
+                    active,
+                    &self.state,
+                    &self.logs,
+                    &self.data_dir,
+                )
                 .await;
+                if verified {
+                    let now_mono = self.clock.now_monotonic();
+                    let now_wall = self.clock.now_wall();
+                    let (post_outcome, wd_snap) = {
+                        let mut wd = self.watchdog_state.lock().unwrap();
+                        wd.clear_wake_verify();
+                        let o = wd.tick(queue_idle, now_mono, now_wall);
+                        (o, wd.snapshot(now_mono))
+                    };
+                    {
+                        let mut guard = self.state.lock().await;
+                        guard.watchdog = wd_snap;
+                    }
+                    outcome.entered_warning |= post_outcome.entered_warning;
+                    outcome.trigger_stop |= post_outcome.trigger_stop;
+                    if post_outcome.entered_warning {
+                        record_watchdog_log(
+                            &self.logs,
+                            &self.data_dir,
+                            "睡眠唤醒三重门禁核验通过，本地闲置看门狗重新进入 3 分钟停机预告。"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
         }
-        if outcome.entered_warning {
-            self.push_log(
-                "本地闲置看门狗进入 3 分钟停机预告（可点击「延长 30 分钟」取消本次自动停机）。"
-                    .to_string(),
-            )
-            .await;
-        }
+
         self.notify_snapshot();
         if outcome.trigger_stop {
             self.stop_session_inner().await?;
@@ -830,21 +901,49 @@ impl SessionManager {
         let Some(agy_bin) = env.agy_cs_path.as_deref().map(PathBuf::from) else {
             return Ok(self.snapshot().await);
         };
-        let accounts = if refresh_quota {
+        let (accounts, partial_warn) = if refresh_quota {
             let proxy_envs = self.resolve_colab_envs().await;
             refresh_agy_colab_quota(&agy_bin, &proxy_envs, self.runner.as_ref()).await?
         } else {
-            list_agy_colab_accounts(&agy_bin, self.runner.as_ref()).await?
+            (
+                list_agy_colab_accounts(&agy_bin, self.runner.as_ref()).await?,
+                None,
+            )
         };
         {
             let mut guard = self.state.lock().await;
             guard.agy_accounts = accounts;
+            if let Some(ref w) = partial_warn {
+                guard.warning_banner = Some(format!("部分 agy-cs 账号额度刷新失败：{w}"));
+            }
+        }
+        if let Some(w) = partial_warn {
+            self.push_log(format!("告警：部分 agy-cs 账号额度刷新失败（{w}）"))
+                .await;
         }
         self.notify_snapshot();
         Ok(self.snapshot().await)
     }
 
     pub async fn switch_agy_account(&self, name: String) -> Result<AppSnapshot, CoreError> {
+        if self.start_in_flight.load(Ordering::SeqCst) {
+            return Err(CoreError::StartInProgress);
+        }
+        if self
+            .account_switch_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(CoreError::InvalidInput {
+                detail: "已有切号操作正在进行中".to_string(),
+            });
+        }
+        let res = self.switch_agy_account_inner(name).await;
+        self.account_switch_in_flight.store(false, Ordering::SeqCst);
+        res
+    }
+
+    async fn switch_agy_account_inner(&self, name: String) -> Result<AppSnapshot, CoreError> {
         {
             let guard = self.state.lock().await;
             if let Some(ref act) = guard.active_session {
@@ -855,6 +954,19 @@ impl SessionManager {
             if let Some(ref pend) = guard.pending_session {
                 return Err(CoreError::SwitchBlockedWhileSessionActive {
                     session_name: pend.session_name.clone(),
+                });
+            }
+            if guard.ledger_corrupted || self.has_running_or_pending_session_sync() {
+                return Err(CoreError::SwitchBlockedWhileSessionActive {
+                    session_name: "corrupted-or-managed".to_string(),
+                });
+            }
+            if matches!(
+                guard.phase,
+                SessionPhase::Starting | SessionPhase::Stopping | SessionPhase::Reconnecting
+            ) {
+                return Err(CoreError::SwitchBlockedWhileSessionActive {
+                    session_name: format!("{:?}", guard.phase),
                 });
             }
         }
@@ -872,9 +984,9 @@ impl SessionManager {
     }
 
     pub async fn switch_back_to_owner_account(&self) -> Result<AppSnapshot, CoreError> {
-        let owner_email = {
+        let (owner_email, tunnel_connected) = {
             let guard = self.state.lock().await;
-            guard
+            let owner = guard
                 .active_session
                 .as_ref()
                 .map(|a| a.owner_email.clone())
@@ -883,9 +995,10 @@ impl SessionManager {
                         .pending_session
                         .as_ref()
                         .map(|p| p.owner_email.clone())
-                })
-        }
-        .ok_or_else(|| CoreError::SessionLedgerMismatch {
+                });
+            (owner, guard.tunnel_connected)
+        };
+        let owner_email = owner_email.ok_or_else(|| CoreError::SessionLedgerMismatch {
             detail: "当前没有需要切回的原会话账号".to_string(),
         })?;
         let env = check_env(self.path_env.as_deref(), self.home_dir.as_deref());
@@ -906,7 +1019,20 @@ impl SessionManager {
         switch_agy_colab_account(&agy_bin, &target_name, self.runner.as_ref()).await?;
         self.push_log(format!("已通过 agy-cs 切回原会话账号 {target_name}。"))
             .await;
+        {
+            let mut guard = self.state.lock().await;
+            if guard
+                .startup_notice
+                .as_ref()
+                .is_some_and(|n| n.kind == "account_changed")
+            {
+                guard.startup_notice = None;
+            }
+        }
         let _ = self.refresh_agy_accounts(false).await;
+        if !tunnel_connected {
+            return Ok(self.reconcile_on_startup().await);
+        }
         Ok(self.refresh_status().await)
     }
 
@@ -1075,6 +1201,16 @@ impl SessionManager {
                 guard.step = None;
                 guard.last_error = None;
                 guard.startup_notice = None;
+            }
+            if let Some(ref email) = guard.account_email.clone() {
+                guard.account_drift_detected = guard
+                    .active_session
+                    .as_ref()
+                    .is_some_and(|a| !a.owner_email.eq_ignore_ascii_case(email))
+                    || guard
+                        .pending_session
+                        .as_ref()
+                        .is_some_and(|p| !p.owner_email.eq_ignore_ascii_case(email));
             }
             guard.sync_managed_flag();
         }
@@ -1518,6 +1654,11 @@ impl SessionManager {
         high_mem: bool,
         allow_zero_balance: bool,
     ) -> Result<AppSnapshot, CoreError> {
+        if self.account_switch_in_flight.load(Ordering::SeqCst) {
+            return Err(CoreError::InvalidInput {
+                detail: "正在切换账号，请稍后再开机".to_string(),
+            });
+        }
         if self
             .start_in_flight
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1694,10 +1835,12 @@ impl SessionManager {
             let mut guard = self.state.lock().await;
             guard.account_email = Some(owner_email.clone());
             guard.auth_required = false;
-            guard.telemetry.estimated_remaining_minutes =
-                estimated_remaining_minutes(usage.current_balance, usage.usage_rate_hourly);
+            let rem = estimated_remaining_minutes(usage.current_balance, usage.usage_rate_hourly);
+            guard.telemetry.estimated_remaining_minutes = rem;
+            guard.low_balance_warning = rem.is_some_and(|m| m < 15);
             guard.usage = Some(usage.clone());
         }
+        self.low_balance_notified.store(false, Ordering::SeqCst);
         self.notify_snapshot();
 
         if usage.current_balance <= 0.0 && !allow_zero_balance {
@@ -2627,6 +2770,9 @@ impl SessionManager {
         let clock = self.clock.clone();
         let watchdog_state = self.watchdog_state.clone();
         let watchdog_stop_notify = self.watchdog_stop_notify.clone();
+        let logs_ref = self.logs.clone();
+        let data_dir_ref = self.data_dir.clone();
+        let low_balance_notified = self.low_balance_notified.clone();
 
         {
             let now_mono = clock.now_monotonic();
@@ -2657,6 +2803,7 @@ impl SessionManager {
                 }
 
                 // Tier 1 (every 3s): local ComfyUI HTTP /system_stats + /queue over loopback proxy
+                let mut fresh_queue_idle: Option<bool> = None;
                 if local_port != 0 {
                     let stats_res = fetch_local_comfy_json(local_port, "/system_stats").await;
                     let queue_res = fetch_local_comfy_json(local_port, "/queue").await;
@@ -2680,6 +2827,7 @@ impl SessionManager {
                         if let Ok((running, pending)) = parse_comfy_queue(&queue_body) {
                             guard.telemetry.queue_running = running;
                             guard.telemetry.queue_pending = pending;
+                            fresh_queue_idle = Some(running == 0 && pending == 0);
                         }
                     }
                 }
@@ -2718,33 +2866,94 @@ impl SessionManager {
                         if let Ok(u) =
                             colab_cli::usage(runner.as_ref(), &colab_bin, &proxy_envs, None).await
                         {
-                            let mut guard = state.lock().await;
-                            let rem =
-                                estimated_remaining_minutes(u.current_balance, u.usage_rate_hourly);
-                            guard.telemetry.estimated_remaining_minutes = rem;
-                            guard.low_balance_warning = rem.is_some_and(|m| m < 15);
-                            guard.usage = Some(u);
+                            let low_hit = {
+                                let mut guard = state.lock().await;
+                                let rem = estimated_remaining_minutes(
+                                    u.current_balance,
+                                    u.usage_rate_hourly,
+                                );
+                                guard.telemetry.estimated_remaining_minutes = rem;
+                                let low = rem.is_some_and(|m| m < 15);
+                                guard.low_balance_warning = low;
+                                guard.usage = Some(u);
+                                low
+                            };
+                            if low_hit && !low_balance_notified.swap(true, Ordering::SeqCst) {
+                                send_macos_notification(
+                                    runner.as_ref(),
+                                    "Colab ComfyUI",
+                                    "剩余可用时长不足 15 分钟，请及时导出工作流与成品。",
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
 
-                // Dual-clock sleep-aware local idle watchdog
-                let queue_idle = {
-                    let guard = state.lock().await;
-                    guard.telemetry.queue_running == 0 && guard.telemetry.queue_pending == 0
-                };
-                let now_mono = clock.now_monotonic();
-                let now_wall = clock.now_wall();
-                let (wd_outcome, wd_snap) = {
-                    let mut wd = watchdog_state.lock().unwrap();
-                    let outcome = wd.tick(queue_idle, now_mono, now_wall);
-                    (outcome, wd.snapshot(now_mono))
-                };
-                {
-                    let mut guard = state.lock().await;
-                    guard.watchdog = wd_snap;
+                // Dual-clock sleep-aware local idle watchdog (H1, H4, M5)
+                let mut wd_outcome = advance_watchdog_tick(
+                    &clock,
+                    &watchdog_state,
+                    &state,
+                    &logs_ref,
+                    &data_dir_ref,
+                    runner.as_ref(),
+                    fresh_queue_idle,
+                )
+                .await;
+                if wd_outcome.needs_wake_verify {
+                    let active_opt = { state.lock().await.active_session.clone() };
+                    if let Some(ref active) = active_opt {
+                        let verified = verify_wake_triple_gate(
+                            runner.as_ref(),
+                            home_dir.as_deref(),
+                            path_env.as_deref(),
+                            proxy_http_hint.as_deref(),
+                            proxy_https_hint.as_deref(),
+                            active,
+                            &state,
+                            &logs_ref,
+                            &data_dir_ref,
+                        )
+                        .await;
+                        if verified {
+                            let now_mono = clock.now_monotonic();
+                            let now_wall = clock.now_wall();
+                            let (post_outcome, wd_snap) = {
+                                let mut wd = watchdog_state.lock().unwrap();
+                                wd.clear_wake_verify();
+                                let o = wd.tick(fresh_queue_idle, now_mono, now_wall);
+                                (o, wd.snapshot(now_mono))
+                            };
+                            {
+                                let mut guard = state.lock().await;
+                                guard.watchdog = wd_snap;
+                            }
+                            wd_outcome.entered_warning |= post_outcome.entered_warning;
+                            wd_outcome.trigger_stop |= post_outcome.trigger_stop;
+                            if post_outcome.entered_warning {
+                                record_watchdog_log(
+                                    &logs_ref,
+                                    &data_dir_ref,
+                                    "睡眠唤醒三重门禁核验通过，本地闲置看门狗重新进入 3 分钟停机预告。"
+                                        .to_string(),
+                                );
+                                send_macos_notification(
+                                    runner.as_ref(),
+                                    "Colab ComfyUI",
+                                    "闲置看门狗将在 3 分钟后自动导出并停机。",
+                                )
+                                .await;
+                            }
+                        }
+                    }
                 }
                 if wd_outcome.trigger_stop {
+                    record_watchdog_log(
+                        &logs_ref,
+                        &data_dir_ref,
+                        "本地闲置看门狗倒计时归零，正在触发自动导出与停机核验。".to_string(),
+                    );
                     watchdog_stop_notify.notify_one();
                 }
 
@@ -2948,8 +3157,18 @@ impl SessionManager {
         } else if let Some(mut proc) = tunnel_proc {
             let _ = proc.kill().await;
         }
+        let now_mono = self.clock.now_monotonic();
+        let now_wall = self.clock.now_wall();
+        let wd_snap = {
+            let mut wd = self.watchdog_state.lock().unwrap();
+            wd.reset_for_new_session(now_mono, now_wall);
+            wd.snapshot(now_mono)
+        };
+        self.low_balance_notified.store(false, Ordering::SeqCst);
         let mut guard = self.state.lock().await;
         guard.tunnel_connected = false;
+        guard.watchdog = wd_snap;
+        guard.low_balance_warning = false;
     }
 
     /// Stops the active (or pending) Colab session and runs triple verification.
@@ -3159,9 +3378,19 @@ impl SessionManager {
 
         if report.safe_to_clear_ledger {
             self.clear_verified_ledger(target).await?;
+            let now_mono = self.clock.now_monotonic();
+            let now_wall = self.clock.now_wall();
+            let wd_snap = {
+                let mut wd = self.watchdog_state.lock().unwrap();
+                wd.reset_for_new_session(now_mono, now_wall);
+                wd.snapshot(now_mono)
+            };
+            self.low_balance_notified.store(false, Ordering::SeqCst);
             let mut guard = self.state.lock().await;
             guard.usage = report.usage.clone();
             guard.last_stop_report = Some(report.clone());
+            guard.watchdog = wd_snap;
+            guard.low_balance_warning = false;
         } else {
             let mut guard = self.state.lock().await;
             guard.phase = SessionPhase::Error;
@@ -3294,6 +3523,142 @@ impl SessionManager {
             )
             .await?;
         Ok((out.exit_code, out.stdout, out.stderr))
+    }
+}
+
+fn record_watchdog_log(logs: &StdMutex<VecDeque<String>>, data_dir: &Path, line: String) {
+    let redacted = redact_sensitive_text(&line);
+    if let Ok(mut q) = logs.lock() {
+        if q.len() >= MAX_LOG_LINES {
+            q.pop_front();
+        }
+        q.push_back(redacted.clone());
+    }
+    let _ = append_app_log_0600(data_dir, &redacted);
+}
+
+#[cfg(not(test))]
+async fn send_macos_notification(runner: &dyn CommandRunner, title: &str, body: &str) {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        esc(body),
+        esc(title)
+    );
+    let spec = crate::runner::CommandSpec::new(
+        "/usr/bin/osascript".to_string(),
+        vec!["-e".to_string(), script],
+        Duration::from_secs(5),
+    );
+    let _ = runner.run(spec, None).await;
+}
+
+#[cfg(test)]
+async fn send_macos_notification(_runner: &dyn CommandRunner, _title: &str, _body: &str) {}
+
+async fn advance_watchdog_tick(
+    clock: &Arc<dyn Clock>,
+    watchdog_state: &Arc<StdMutex<WatchdogState>>,
+    state: &Arc<Mutex<InnerState>>,
+    logs: &Arc<StdMutex<VecDeque<String>>>,
+    data_dir: &Path,
+    runner: &dyn CommandRunner,
+    queue_idle: Option<bool>,
+) -> crate::watchdog::WatchdogTickOutcome {
+    let now_mono = clock.now_monotonic();
+    let now_wall = clock.now_wall();
+    let (outcome, wd_snap) = {
+        let mut wd = watchdog_state.lock().unwrap();
+        let outcome = wd.tick(queue_idle, now_mono, now_wall);
+        (outcome, wd.snapshot(now_mono))
+    };
+    {
+        let mut guard = state.lock().await;
+        guard.watchdog = wd_snap;
+    }
+    if outcome.sleep_wake_detected {
+        record_watchdog_log(
+            logs,
+            data_dir,
+            "检测到 Mac 睡眠唤醒，已重置看门狗并等待三重门禁与 /queue 核验。".to_string(),
+        );
+    }
+    if outcome.entered_warning {
+        record_watchdog_log(
+            logs,
+            data_dir,
+            "本地闲置看门狗进入 3 分钟停机预告（可点击「延长 30 分钟」取消本次自动停机）。"
+                .to_string(),
+        );
+        send_macos_notification(
+            runner,
+            "Colab ComfyUI",
+            "闲置看门狗将在 3 分钟后自动导出并停机。",
+        )
+        .await;
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_wake_triple_gate(
+    runner: &dyn CommandRunner,
+    home_dir: Option<&Path>,
+    path_env: Option<&std::ffi::OsStr>,
+    proxy_http_hint: Option<&std::ffi::OsStr>,
+    proxy_https_hint: Option<&std::ffi::OsStr>,
+    active: &ActiveSession,
+    state: &Arc<Mutex<InnerState>>,
+    logs: &Arc<StdMutex<VecDeque<String>>>,
+    data_dir: &Path,
+) -> bool {
+    let env = check_env(path_env, home_dir);
+    let Some(colab_bin) = env.colab_path.map(PathBuf::from) else {
+        return false;
+    };
+    let proxy_envs = resolve_proxy_envs(runner, proxy_http_hint, proxy_https_hint).await;
+    let Ok(current_email) = colab_cli::whoami(runner, &colab_bin, &proxy_envs, None).await else {
+        record_watchdog_log(
+            logs,
+            data_dir,
+            "睡眠唤醒核验：colab whoami 失败，暂缓看门狗停机。".to_string(),
+        );
+        return false;
+    };
+    if !current_email.eq_ignore_ascii_case(&active.owner_email) {
+        let mut guard = state.lock().await;
+        guard.account_email = Some(current_email);
+        guard.account_drift_detected = true;
+        record_watchdog_log(
+            logs,
+            data_dir,
+            "睡眠唤醒核验：检测到外部已切换账号，已阻止自动停机，请切回原号。".to_string(),
+        );
+        return false;
+    }
+    match colab_cli::status(runner, &colab_bin, &active.session_name, &proxy_envs, None).await {
+        Ok(SessionStatusLookup::Present(entry)) => {
+            if entry.endpoint_sha256 != active.endpoint_sha256 {
+                record_watchdog_log(
+                    logs,
+                    data_dir,
+                    "睡眠唤醒核验：远端端点指纹与账本不一致，暂缓自动停机。".to_string(),
+                );
+                return false;
+            }
+            true
+        }
+        Ok(SessionStatusLookup::Missing) => {
+            record_watchdog_log(
+                logs,
+                data_dir,
+                "睡眠唤醒核验：远端会话已不存在（可能已被 Colab 闲置回收）。".to_string(),
+            );
+            let mut guard = state.lock().await;
+            guard.phase = SessionPhase::DisconnectedOrMissing;
+            false
+        }
+        Err(_) => false,
     }
 }
 
@@ -5220,7 +5585,7 @@ mod tests {
                             ));
                         }
                         if args.get(1).map(String::as_str) == Some("switch") {
-                            let name = args.get(2).cloned().unwrap_or_default();
+                            let name = args.last().cloned().unwrap_or_default();
                             switch_log.lock().unwrap().push(name);
                             drifted_flag.store(false, Ordering::SeqCst);
                             return Ok(CommandOutput::from_raw(
@@ -5313,7 +5678,22 @@ mod tests {
                 vec!["alice_alias".to_string()]
             );
 
-            // Dual-clock watchdog: 30m idle -> Warning (180s) -> sleep jump 2h -> full 180s warning again -> +180s stops
+            // H3: ledger_corrupted blocks manual account switch
+            {
+                let mut guard = mgr.state.lock().await;
+                guard.ledger_corrupted = true;
+            }
+            let corrupted_block = mgr
+                .switch_agy_account("bob_alias".to_string())
+                .await
+                .unwrap_err();
+            assert_eq!(corrupted_block.code(), "SWITCH_BLOCKED_ACTIVE_SESSION");
+            {
+                let mut guard = mgr.state.lock().await;
+                guard.ledger_corrupted = false;
+            }
+
+            // Dual-clock watchdog: 30m idle -> Warning (180s) -> sleep jump 2h -> wake verify + fresh /queue -> full 180s warning -> +180s stops
             clock.advance(1800, 1800);
             assert!(!mgr.step_watchdog_once().await.unwrap());
             assert_eq!(
@@ -5321,15 +5701,29 @@ mod tests {
                 crate::watchdog::WatchdogPhase::Warning
             );
             clock.advance(10, 7200);
-            assert!(!mgr.step_watchdog_once().await.unwrap());
+            assert!(!mgr
+                .step_watchdog_with_probe(Some(Some(true)))
+                .await
+                .unwrap());
             assert!(mgr.snapshot().await.watchdog.sleep_wake_notice);
             assert_eq!(
                 mgr.snapshot().await.watchdog.warning_remaining_secs,
                 Some(180)
             );
-            clock.advance(180, 180);
-            assert!(mgr.step_watchdog_once().await.unwrap());
+            // H1: None probe pauses/blocks stop even past 180s
+            clock.advance(185, 185);
+            assert!(!mgr.step_watchdog_with_probe(Some(None)).await.unwrap());
+            // Fresh Some(true) completes stop and resets watchdog
+            clock.advance(3, 3);
+            assert!(mgr
+                .step_watchdog_with_probe(Some(Some(true)))
+                .await
+                .unwrap());
             assert!(mgr.snapshot().await.active_session.is_none());
+            assert_eq!(
+                mgr.snapshot().await.watchdog.phase,
+                crate::watchdog::WatchdogPhase::Counting
+            );
         });
     }
 }

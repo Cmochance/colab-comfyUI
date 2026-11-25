@@ -465,10 +465,24 @@ pub fn run() {
                 }
             });
             let mgr_wd = manager.clone();
+            let handle_wd = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     mgr_wd.wait_watchdog_stop_request().await;
-                    let _ = mgr_wd.stop_session().await;
+                    match mgr_wd.stop_session().await {
+                        Ok(report) => {
+                            if report.safe_to_clear_ledger {
+                                if let Some(canvas) = handle_wd.get_webview_window("canvas") {
+                                    let _ = canvas.close();
+                                }
+                            } else {
+                                mgr_wd.reset_watchdog_after_failed_stop().await;
+                            }
+                        }
+                        Err(_) => {
+                            mgr_wd.reset_watchdog_after_failed_stop().await;
+                        }
+                    }
                 }
             });
             Ok(())

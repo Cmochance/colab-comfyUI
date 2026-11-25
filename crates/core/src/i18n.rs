@@ -128,6 +128,10 @@ pub enum MsgKey {
     WatchdogLabel,
     WatchdogOffOption,
     WatchdogExtendBtn,
+    WatchdogWarningBanner,
+    WatchdogSleepWakeBanner,
+    WatchdogMinutesOption,
+    AgySwitcherNotFound,
     LowBalanceWarningBanner,
 }
 
@@ -229,6 +233,10 @@ impl MsgKey {
             Self::WatchdogLabel => "watchdog_label",
             Self::WatchdogOffOption => "watchdog_off_option",
             Self::WatchdogExtendBtn => "watchdog_extend_btn",
+            Self::WatchdogWarningBanner => "watchdog_warning_banner",
+            Self::WatchdogSleepWakeBanner => "watchdog_sleep_wake_banner",
+            Self::WatchdogMinutesOption => "watchdog_minutes_option",
+            Self::AgySwitcherNotFound => "agy_switcher_not_found",
             Self::LowBalanceWarningBanner => "low_balance_warning_banner",
         }
     }
@@ -330,6 +338,10 @@ impl MsgKey {
             Self::WatchdogLabel,
             Self::WatchdogOffOption,
             Self::WatchdogExtendBtn,
+            Self::WatchdogWarningBanner,
+            Self::WatchdogSleepWakeBanner,
+            Self::WatchdogMinutesOption,
+            Self::AgySwitcherNotFound,
             Self::LowBalanceWarningBanner,
         ]
     }
@@ -434,6 +446,10 @@ pub fn t(locale: Locale, key: MsgKey) -> &'static str {
             MsgKey::WatchdogLabel => "闲置自动停机看门狗",
             MsgKey::WatchdogOffOption => "关闭",
             MsgKey::WatchdogExtendBtn => "延长 30 分钟",
+            MsgKey::WatchdogWarningBanner => "闲置自动停机看门狗：将在 {secs}s 后自动导出并停机。",
+            MsgKey::WatchdogSleepWakeBanner => "检测到 Mac 睡眠唤醒，已重置闲置看门狗并等待重查队列。",
+            MsgKey::WatchdogMinutesOption => "{mins} 分钟",
+            MsgKey::AgySwitcherNotFound => "未检测到 Agy Switcher.app，请在终端执行 `colab whoami` 登录或安装 agy-cs。",
             MsgKey::LowBalanceWarningBanner => "按当前消耗速率估算剩余可用时间不足 15 分钟，请及时导出工作流与成品。",
         },
         Locale::En => match key {
@@ -532,6 +548,10 @@ pub fn t(locale: Locale, key: MsgKey) -> &'static str {
             MsgKey::WatchdogLabel => "Idle Auto-Stop Watchdog",
             MsgKey::WatchdogOffOption => "Off",
             MsgKey::WatchdogExtendBtn => "Extend +30 min",
+            MsgKey::WatchdogWarningBanner => "Idle auto-stop watchdog: exporting and stopping in {secs}s.",
+            MsgKey::WatchdogSleepWakeBanner => "macOS sleep/wake detected. Idle watchdog reset; waiting for /queue recheck.",
+            MsgKey::WatchdogMinutesOption => "{mins} min",
+            MsgKey::AgySwitcherNotFound => "Agy Switcher.app not found. Run `colab whoami` in terminal or install agy-cs.",
             MsgKey::LowBalanceWarningBanner => "Estimated remaining runtime is under 15 minutes at the current burn rate. Export your work soon.",
         },
     }

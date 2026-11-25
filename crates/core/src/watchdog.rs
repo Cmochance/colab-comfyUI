@@ -62,6 +62,7 @@ pub struct WatchdogTickOutcome {
     pub entered_warning: bool,
     pub trigger_stop: bool,
     pub sleep_wake_detected: bool,
+    pub needs_wake_verify: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +70,13 @@ pub struct WatchdogState {
     threshold_minutes: Option<u32>,
     phase: WatchdogPhase,
     idle_secs: u64,
-    bonus_grace_secs: u64,
+    override_threshold_secs: Option<u64>,
     last_mono: Instant,
     last_wall: SystemTime,
     warning_started_mono: Option<Instant>,
     sleep_wake_notice: bool,
+    pending_wake_verify: bool,
+    has_fresh_idle_since_warning: bool,
 }
 
 impl WatchdogState {
@@ -87,11 +90,13 @@ impl WatchdogState {
                 WatchdogPhase::Disabled
             },
             idle_secs: 0,
-            bonus_grace_secs: 0,
+            override_threshold_secs: None,
             last_mono: now_mono,
             last_wall: now_wall,
             warning_started_mono: None,
             sleep_wake_notice: false,
+            pending_wake_verify: false,
+            has_fresh_idle_since_warning: false,
         }
     }
 
@@ -105,9 +110,11 @@ impl WatchdogState {
         self.last_mono = now_mono;
         self.last_wall = now_wall;
         self.idle_secs = 0;
-        self.bonus_grace_secs = 0;
+        self.override_threshold_secs = None;
         self.warning_started_mono = None;
         self.sleep_wake_notice = false;
+        self.pending_wake_verify = false;
+        self.has_fresh_idle_since_warning = false;
         self.phase = if self.threshold_minutes.is_some() {
             WatchdogPhase::Counting
         } else {
@@ -119,9 +126,26 @@ impl WatchdogState {
         self.last_mono = now_mono;
         self.last_wall = now_wall;
         self.idle_secs = 0;
-        self.bonus_grace_secs = 0;
+        self.override_threshold_secs = None;
         self.warning_started_mono = None;
         self.sleep_wake_notice = false;
+        self.pending_wake_verify = false;
+        self.has_fresh_idle_since_warning = false;
+        self.phase = if self.threshold_minutes.is_some() {
+            WatchdogPhase::Counting
+        } else {
+            WatchdogPhase::Disabled
+        };
+    }
+
+    pub fn reset_after_failed_stop(&mut self, now_mono: Instant, now_wall: SystemTime) {
+        self.last_mono = now_mono;
+        self.last_wall = now_wall;
+        self.idle_secs = 0;
+        self.override_threshold_secs = None;
+        self.warning_started_mono = None;
+        self.pending_wake_verify = false;
+        self.has_fresh_idle_since_warning = false;
         self.phase = if self.threshold_minutes.is_some() {
             WatchdogPhase::Counting
         } else {
@@ -133,15 +157,19 @@ impl WatchdogState {
         if self.threshold_minutes.is_none() {
             return;
         }
-        let base_secs = u64::from(self.threshold_minutes.unwrap_or(0)) * 60;
-        let extra_secs = u64::from(extra_minutes) * 60;
-        self.bonus_grace_secs = extra_secs.saturating_sub(base_secs);
+        self.override_threshold_secs = Some(u64::from(extra_minutes.clamp(1, 240)) * 60);
         self.idle_secs = 0;
         self.warning_started_mono = None;
         self.sleep_wake_notice = false;
+        self.pending_wake_verify = false;
+        self.has_fresh_idle_since_warning = false;
         self.last_mono = now_mono;
         self.last_wall = now_wall;
         self.phase = WatchdogPhase::Counting;
+    }
+
+    pub fn clear_wake_verify(&mut self) {
+        self.pending_wake_verify = false;
     }
 
     pub fn dismiss_sleep_notice(&mut self) {
@@ -166,9 +194,18 @@ impl WatchdogState {
         }
     }
 
+    fn effective_threshold_secs(&self, mins: u32) -> u64 {
+        self.override_threshold_secs
+            .unwrap_or_else(|| u64::from(mins) * 60)
+    }
+
+    /// Advances the watchdog using `queue_idle`:
+    /// - `Some(true)`: fresh `/queue` probe confirmed 0 running & 0 pending
+    /// - `Some(false)`: fresh `/queue` probe showed work running/pending
+    /// - `None`: `/queue` probe timed out or failed (pauses idle counting & blocks auto-stop)
     pub fn tick(
         &mut self,
-        queue_idle: bool,
+        queue_idle: Option<bool>,
         now_mono: Instant,
         now_wall: SystemTime,
     ) -> WatchdogTickOutcome {
@@ -191,38 +228,55 @@ impl WatchdogState {
         self.last_mono = now_mono;
         self.last_wall = now_wall;
 
+        let threshold_secs = self.effective_threshold_secs(mins);
         let jump = (delta_wall_secs - delta_mono_secs).abs();
         if jump > WATCHDOG_SLEEP_JUMP_SECS {
             outcome.sleep_wake_detected = true;
+            outcome.needs_wake_verify = true;
             self.sleep_wake_notice = true;
-            if !queue_idle {
-                self.idle_secs = 0;
-                self.bonus_grace_secs = 0;
+            self.pending_wake_verify = true;
+            self.has_fresh_idle_since_warning = false;
+            if self.phase == WatchdogPhase::Warning || self.idle_secs >= threshold_secs {
+                // Defer warning restart until triple-gate + fresh /queue verification passes.
+                self.phase = WatchdogPhase::Counting;
                 self.warning_started_mono = None;
+                self.idle_secs = threshold_secs;
+            } else {
+                // M4: reset partial idle counter on sleep/wake so UI notice is accurate.
+                self.phase = WatchdogPhase::Counting;
+                self.warning_started_mono = None;
+                self.idle_secs = 0;
+                self.override_threshold_secs = None;
+            }
+            return outcome;
+        }
+
+        match queue_idle {
+            Some(false) => {
+                self.idle_secs = 0;
+                self.override_threshold_secs = None;
+                self.warning_started_mono = None;
+                self.pending_wake_verify = false;
+                self.has_fresh_idle_since_warning = false;
                 self.phase = WatchdogPhase::Counting;
                 return outcome;
             }
-            // Never skip the 3-minute warning countdown immediately after sleep wake:
-            // if already warning or past threshold, restart a full 180s warning window.
-            let threshold_secs = u64::from(mins) * 60 + self.bonus_grace_secs;
-            if self.phase == WatchdogPhase::Warning || self.idle_secs >= threshold_secs {
-                self.phase = WatchdogPhase::Warning;
-                self.warning_started_mono = Some(now_mono);
-                outcome.entered_warning = true;
+            None => {
+                // Unknown /queue state (timeout or tunnel stall): pause idle accumulation
+                // and never trigger stop until a fresh /queue == 0/0 succeeds.
+                if self.pending_wake_verify {
+                    outcome.needs_wake_verify = true;
+                }
                 return outcome;
             }
+            Some(true) => {}
+        }
+
+        if self.pending_wake_verify {
+            outcome.needs_wake_verify = true;
             return outcome;
         }
 
-        if !queue_idle {
-            self.idle_secs = 0;
-            self.bonus_grace_secs = 0;
-            self.warning_started_mono = None;
-            self.phase = WatchdogPhase::Counting;
-            return outcome;
-        }
-
-        let threshold_secs = u64::from(mins) * 60 + self.bonus_grace_secs;
         match self.phase {
             WatchdogPhase::Disabled | WatchdogPhase::Stopping => {}
             WatchdogPhase::Counting => {
@@ -230,13 +284,15 @@ impl WatchdogState {
                 if self.idle_secs >= threshold_secs {
                     self.phase = WatchdogPhase::Warning;
                     self.warning_started_mono = Some(now_mono);
+                    self.has_fresh_idle_since_warning = true;
                     outcome.entered_warning = true;
                 }
             }
             WatchdogPhase::Warning => {
+                self.has_fresh_idle_since_warning = true;
                 if let Some(started) = self.warning_started_mono {
                     let elapsed = now_mono.saturating_duration_since(started).as_secs();
-                    if elapsed >= WATCHDOG_WARNING_SECS {
+                    if elapsed >= WATCHDOG_WARNING_SECS && self.has_fresh_idle_since_warning {
                         self.phase = WatchdogPhase::Stopping;
                         outcome.trigger_stop = true;
                     }
@@ -259,108 +315,166 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn watchdog_counts_idle_warns_for_180s_and_triggers_stop() {
+    fn watchdog_counts_idle_warns_for_180s_and_triggers_stop_and_pauses_on_none() {
         let m0 = Instant::now();
         let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let mut wd = WatchdogState::new(Some(30), m0, w0);
 
-        // Busy queue resets idle counter.
         let o1 = wd.tick(
-            true,
+            Some(true),
             m0 + Duration::from_secs(600),
             w0 + Duration::from_secs(600),
         );
         assert!(!o1.entered_warning);
         assert_eq!(wd.snapshot(m0 + Duration::from_secs(600)).idle_secs, 600);
 
-        let _ = wd.tick(
-            false,
-            m0 + Duration::from_secs(610),
-            w0 + Duration::from_secs(610),
+        // H1: None pauses idle accumulation without resetting or advancing.
+        let o_none = wd.tick(
+            None,
+            m0 + Duration::from_secs(1200),
+            w0 + Duration::from_secs(1200),
         );
-        assert_eq!(wd.snapshot(m0 + Duration::from_secs(610)).idle_secs, 0);
+        assert!(!o_none.entered_warning);
+        assert_eq!(wd.snapshot(m0 + Duration::from_secs(1200)).idle_secs, 600);
+
+        // Busy queue resets idle counter.
+        let _ = wd.tick(
+            Some(false),
+            m0 + Duration::from_secs(1210),
+            w0 + Duration::from_secs(1210),
+        );
+        assert_eq!(wd.snapshot(m0 + Duration::from_secs(1210)).idle_secs, 0);
 
         // Reach 30m idle -> enters Warning (180s).
         let o2 = wd.tick(
-            true,
-            m0 + Duration::from_secs(610 + 1800),
-            w0 + Duration::from_secs(610 + 1800),
+            Some(true),
+            m0 + Duration::from_secs(1210 + 1800),
+            w0 + Duration::from_secs(1210 + 1800),
         );
         assert!(o2.entered_warning);
         assert!(!o2.trigger_stop);
-        assert_eq!(
-            wd.snapshot(m0 + Duration::from_secs(610 + 1800))
-                .warning_remaining_secs,
-            Some(180)
-        );
 
-        // After 180s in Warning -> triggers stop.
+        // H1: None during Warning blocks trigger_stop even past 180s until fresh Some(true).
+        let o_warn_none = wd.tick(
+            None,
+            m0 + Duration::from_secs(1210 + 1800 + 200),
+            w0 + Duration::from_secs(1210 + 1800 + 200),
+        );
+        assert!(!o_warn_none.trigger_stop);
+
         let o3 = wd.tick(
-            true,
-            m0 + Duration::from_secs(610 + 1800 + 180),
-            w0 + Duration::from_secs(610 + 1800 + 180),
+            Some(true),
+            m0 + Duration::from_secs(1210 + 1800 + 203),
+            w0 + Duration::from_secs(1210 + 1800 + 203),
         );
         assert!(o3.trigger_stop);
     }
 
     #[test]
-    fn sleep_wake_jump_restarts_full_warning_instead_of_immediate_stop() {
+    fn sleep_wake_jump_requires_verify_then_restarts_full_warning_and_resets_partial_idle() {
         let m0 = Instant::now();
         let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let mut wd = WatchdogState::new(Some(15), m0, w0);
 
-        // Reach 15m idle -> Warning.
+        // M4: partial idle (< threshold) resets to 0 on wake.
+        let mut wd_partial = WatchdogState::new(Some(30), m0, w0);
+        let _ = wd_partial.tick(
+            Some(true),
+            m0 + Duration::from_secs(1000),
+            w0 + Duration::from_secs(1000),
+        );
+        let wake_partial = wd_partial.tick(
+            Some(true),
+            m0 + Duration::from_secs(1005),
+            w0 + Duration::from_secs(1000 + 7200),
+        );
+        assert!(wake_partial.sleep_wake_detected);
+        assert_eq!(
+            wd_partial
+                .snapshot(m0 + Duration::from_secs(1005))
+                .idle_secs,
+            0
+        );
+
+        // H1: Warning state + wake -> waits for clear_wake_verify() before restarting 180s warning.
+        let mut wd = WatchdogState::new(Some(15), m0, w0);
         let enter = wd.tick(
-            true,
+            Some(true),
             m0 + Duration::from_secs(900),
             w0 + Duration::from_secs(900),
         );
         assert!(enter.entered_warning);
 
-        // Simulate Mac sleeping 2 hours (wall jumped +7200s, monotonic only +5s).
         let wake = wd.tick(
-            true,
+            None,
             m0 + Duration::from_secs(905),
             w0 + Duration::from_secs(900 + 7200),
         );
         assert!(wake.sleep_wake_detected);
-        assert!(
-            !wake.trigger_stop,
-            "must never immediately stop on sleep wake without a fresh 3m warning"
+        assert!(wake.needs_wake_verify);
+        assert!(!wake.trigger_stop);
+        assert!(!wake.entered_warning);
+
+        // Still blocked until clear_wake_verify()
+        let before_verify = wd.tick(
+            Some(true),
+            m0 + Duration::from_secs(908),
+            w0 + Duration::from_secs(900 + 7203),
         );
-        assert!(wake.entered_warning);
+        assert!(before_verify.needs_wake_verify);
+        assert!(!before_verify.entered_warning);
+
+        wd.clear_wake_verify();
+        let after_verify = wd.tick(
+            Some(true),
+            m0 + Duration::from_secs(911),
+            w0 + Duration::from_secs(900 + 7206),
+        );
+        assert!(after_verify.entered_warning);
         assert_eq!(
-            wd.snapshot(m0 + Duration::from_secs(905))
+            wd.snapshot(m0 + Duration::from_secs(911))
                 .warning_remaining_secs,
             Some(180)
         );
     }
 
     #[test]
-    fn extend_clears_warning_and_grants_30_minutes() {
-        let m0 = Instant::now();
-        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let mut wd = WatchdogState::new(Some(15), m0, w0);
-        let _ = wd.tick(
-            true,
-            m0 + Duration::from_secs(900),
-            w0 + Duration::from_secs(900),
-        );
-        wd.extend(
-            30,
-            m0 + Duration::from_secs(930),
-            w0 + Duration::from_secs(930),
-        );
-        assert_eq!(
-            wd.snapshot(m0 + Duration::from_secs(930)).phase,
-            WatchdogPhase::Counting
-        );
-        // 20 minutes later still counting because extend(30) granted 30 minutes
-        let o = wd.tick(
-            true,
-            m0 + Duration::from_secs(930 + 1200),
-            w0 + Duration::from_secs(930 + 1200),
-        );
-        assert!(!o.entered_warning);
+    fn extend_30_grants_exact_30_minutes_across_15_30_and_60_min_tiers() {
+        for tier in [15u32, 30, 60] {
+            let m0 = Instant::now();
+            let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            let mut wd = WatchdogState::new(Some(tier), m0, w0);
+            let t_tier = u64::from(tier) * 60;
+            let _ = wd.tick(
+                Some(true),
+                m0 + Duration::from_secs(t_tier),
+                w0 + Duration::from_secs(t_tier),
+            );
+            wd.extend(
+                30,
+                m0 + Duration::from_secs(t_tier + 10),
+                w0 + Duration::from_secs(t_tier + 10),
+            );
+            assert_eq!(
+                wd.snapshot(m0 + Duration::from_secs(t_tier + 10)).phase,
+                WatchdogPhase::Counting
+            );
+            // At 29m59s after extend(30): still Counting
+            let before = wd.tick(
+                Some(true),
+                m0 + Duration::from_secs(t_tier + 10 + 1799),
+                w0 + Duration::from_secs(t_tier + 10 + 1799),
+            );
+            assert!(!before.entered_warning, "tier {tier} entered early");
+            // At 30m00s after extend(30): enters Warning
+            let exact = wd.tick(
+                Some(true),
+                m0 + Duration::from_secs(t_tier + 10 + 1800),
+                w0 + Duration::from_secs(t_tier + 10 + 1800),
+            );
+            assert!(
+                exact.entered_warning,
+                "tier {tier} did not enter at exact 30m"
+            );
+        }
     }
 }
