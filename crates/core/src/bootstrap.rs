@@ -7,28 +7,44 @@ use crate::CoreError;
 
 pub const COMFY_READY_SENTINEL: &str = "COMFY_READY=1";
 pub const CORS_HEADER_BUSY_SENTINEL: &str = "CORS_HEADER_ACTIVE_QUEUE_BUSY=1";
+pub const LAYOUT_CHANGED_BUSY_SENTINEL: &str = "PERSISTENCE_LAYOUT_CHANGED_BUSY=1";
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapOutcome {
     pub cors_header_busy_warning: bool,
+    pub layout_changed_busy_warning: bool,
 }
 
-/// Generates the Phase 1 remote ComfyUI setup & launch bash script.
+/// Generates the Phase 2 remote ComfyUI setup & Drive persistence bash script.
 ///
-/// Security invariants:
-/// - Preserves Colab's preinstalled CUDA PyTorch (`torch/torchvision/torchaudio`).
+/// Security & stability invariants:
+/// - Freezes Colab's preinstalled core packages (`torch`, `torchvision`, `torchaudio`,
+///   `numpy`, `transformers`, `pillow`, `safetensors`) into `/tmp/colab_constraints.txt`
+///   and passes `-c /tmp/colab_constraints.txt` to every `pip` / `uv pip` install.
 /// - Never launches `main.py` with `--enable-cors-header`.
-/// - During hot-takeover, checks `/proc/[0-9]*/cmdline` for `--enable-cors-header`
-///   and automatically restarts ComfyUI if `/queue` is idle.
-pub fn build_remote_setup_script(comfy_port: u16) -> String {
+/// - When `use_drive` is true and `/content/drive` is mounted, verifies file count & total bytes
+///   before removing local directories when linking to Drive, and supports `<url> <commit_sha>`
+///   in `custom_nodes_repos.txt`.
+/// - When `use_drive` is false (or unmounted), cleans dangling symlinks and `extra_model_paths.yaml`
+///   and restarts an idle ComfyUI instance if persistence layout changed.
+pub fn build_remote_setup_script(comfy_port: u16, use_drive: bool) -> String {
+    let use_drive_flag = if use_drive { "true" } else { "false" };
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
 
 COMFY_PORT="{comfy_port}"
+USE_DRIVE="{use_drive_flag}"
 COMFY_DIR="/content/ComfyUI"
+DRIVE_MOUNT_PATH="/content/drive/MyDrive"
+DRIVE_ROOT="${{DRIVE_MOUNT_PATH}}/ComfyUI"
 MANAGER_DIR="${{COMFY_DIR}}/custom_nodes/ComfyUI-Manager"
+
+DRIVE_MOUNTED=false
+if [ "${{USE_DRIVE}}" = true ] && [ -d "${{DRIVE_MOUNT_PATH}}" ] && grep -qs ' /content/drive' /proc/mounts; then
+  DRIVE_MOUNTED=true
+fi
 
 echo "=== [bootstrap] Hardware & Disk ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "CPU"
@@ -55,26 +71,183 @@ else
   echo "=== [bootstrap] ComfyUI-Manager already present ==="
 fi
 
+# Freeze Colab preinstalled core packages to prevent custom nodes from downgrading CUDA torch/numpy
+python3 - <<'PY' > /tmp/colab_constraints.txt
+import importlib.metadata as meta
+
+pkgs = ("torch", "torchvision", "torchaudio", "numpy", "transformers", "pillow", "safetensors")
+for p in pkgs:
+    try:
+        v = meta.version(p)
+        print(f"{{p}}=={{v}}")
+    except meta.PackageNotFoundError:
+        pass
+PY
+
 pip_install_req() {{
   local req_file="$1"
   if [ ! -s "${{req_file}}" ]; then
     return 0
   fi
-  if command -v uv >/dev/null 2>&1; then
-    uv pip install --system -q -r "${{req_file}}"
-  else
-    python3 -m pip install -q -r "${{req_file}}"
+  local filtered="/tmp/req_filtered_$$.txt"
+  grep -Evi '^(torch|torchvision|torchaudio)($|[=<>!~ ;[])' "${{req_file}}" > "${{filtered}}" || true
+  if [ ! -s "${{filtered}}" ]; then
+    rm -f "${{filtered}}"
+    return 0
   fi
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install --system -q -c /tmp/colab_constraints.txt -r "${{filtered}}"
+  else
+    python3 -m pip install -q -c /tmp/colab_constraints.txt -r "${{filtered}}"
+  fi
+  rm -f "${{filtered}}"
 }}
+
+layout_changed=0
+
+link_dir_to_drive() {{
+  local local_dir="$1"
+  local drive_dir="$2"
+  mkdir -p "${{drive_dir}}"
+  if [ -L "${{local_dir}}" ]; then
+    local target
+    target="$(readlink -f "${{local_dir}}" 2>/dev/null || true)"
+    local drive_real
+    drive_real="$(readlink -f "${{drive_dir}}" 2>/dev/null || echo "${{drive_dir}}")"
+    if [ "${{target}}" = "${{drive_real}}" ]; then
+      return 0
+    fi
+    rm -f "${{local_dir}}"
+    layout_changed=1
+  elif [ -d "${{local_dir}}" ]; then
+    python3 - "${{local_dir}}" "${{drive_dir}}" <<'PY'
+import os, shutil, sys
+
+src_root, dst_root = sys.argv[1], sys.argv[2]
+src_count = 0
+src_bytes = 0
+for dirpath, _, filenames in os.walk(src_root):
+    rel = os.path.relpath(dirpath, src_root)
+    dst_dir = dst_root if rel == "." else os.path.join(dst_root, rel)
+    os.makedirs(dst_dir, exist_ok=True)
+    for name in filenames:
+        src_file = os.path.join(dirpath, name)
+        dst_file = os.path.join(dst_dir, name)
+        src_count += 1
+        src_bytes += os.path.getsize(src_file)
+        if not os.path.exists(dst_file):
+            shutil.copy2(src_file, dst_file)
+
+# Verify every source file exists on destination with matching size before removing source
+verified_count = 0
+verified_bytes = 0
+for dirpath, _, filenames in os.walk(src_root):
+    rel = os.path.relpath(dirpath, src_root)
+    dst_dir = dst_root if rel == "." else os.path.join(dst_root, rel)
+    for name in filenames:
+        dst_file = os.path.join(dst_dir, name)
+        if not os.path.isfile(dst_file):
+            raise SystemExit(f"Drive copy verification failed: missing {{dst_file}}")
+        verified_count += 1
+        verified_bytes += os.path.getsize(dst_file)
+
+if verified_count != src_count or verified_bytes < src_bytes:
+    raise SystemExit(f"Drive copy verification mismatch: count={{verified_count}}/{{src_count}} bytes={{verified_bytes}}/{{src_bytes}}")
+shutil.rmtree(src_root)
+PY
+    layout_changed=1
+  fi
+  mkdir -p "$(dirname "${{local_dir}}")"
+  ln -s "${{drive_dir}}" "${{local_dir}}"
+}}
+
+if [ "${{DRIVE_MOUNTED}}" = true ]; then
+  echo "=== [bootstrap] Configuring Google Drive persistence (${{DRIVE_ROOT}}) ==="
+  mkdir -p \
+    "${{DRIVE_ROOT}}/user_default/workflows" \
+    "${{DRIVE_ROOT}}/output" \
+    "${{DRIVE_ROOT}}/input" \
+    "${{DRIVE_ROOT}}/models/checkpoints" \
+    "${{DRIVE_ROOT}}/models/loras" \
+    "${{DRIVE_ROOT}}/models/diffusion_models" \
+    "${{DRIVE_ROOT}}/models/text_encoders" \
+    "${{DRIVE_ROOT}}/models/vae" \
+    "${{DRIVE_ROOT}}/models/controlnet" \
+    "${{DRIVE_ROOT}}/models/upscale_models" \
+    "${{DRIVE_ROOT}}/models/clip_vision"
+
+  link_dir_to_drive "${{COMFY_DIR}}/user/default" "${{DRIVE_ROOT}}/user_default"
+  link_dir_to_drive "${{COMFY_DIR}}/output" "${{DRIVE_ROOT}}/output"
+  link_dir_to_drive "${{COMFY_DIR}}/input" "${{DRIVE_ROOT}}/input"
+
+  cat > /tmp/extra_model_paths.yaml.new <<YAML
+colab_drive:
+  base_path: ${{DRIVE_ROOT}}/models
+  checkpoints: checkpoints/
+  loras: loras/
+  diffusion_models: diffusion_models/
+  text_encoders: text_encoders/
+  vae: vae/
+  controlnet: controlnet/
+  upscale_models: upscale_models/
+  clip_vision: clip_vision/
+YAML
+  if [ ! -f "${{COMFY_DIR}}/extra_model_paths.yaml" ] || ! cmp -s /tmp/extra_model_paths.yaml.new "${{COMFY_DIR}}/extra_model_paths.yaml"; then
+    mv /tmp/extra_model_paths.yaml.new "${{COMFY_DIR}}/extra_model_paths.yaml"
+    layout_changed=1
+  else
+    rm -f /tmp/extra_model_paths.yaml.new
+  fi
+
+  if [ -s "${{DRIVE_ROOT}}/custom_nodes_repos.txt" ]; then
+    echo "=== [bootstrap] Restoring custom nodes from Drive ==="
+    while IFS= read -r line || [ -n "${{line}}" ]; do
+      line="$(echo "${{line}}" | xargs)"
+      [ -z "${{line}}" ] && continue
+      [[ "${{line}}" == \#* ]] && continue
+      read -r repo_url commit_sha _ <<<"${{line}}"
+      [ -z "${{repo_url}}" ] && continue
+      repo_name="$(basename "${{repo_url}}" .git)"
+      node_dir="${{COMFY_DIR}}/custom_nodes/${{repo_name}}"
+      if [ ! -d "${{node_dir}}/.git" ]; then
+        echo "[custom_nodes] Cloning ${{repo_name}} (${{repo_url}})"
+        git clone --depth 1 "${{repo_url}}" "${{node_dir}}"
+        if [ -n "${{commit_sha:-}}" ]; then
+          git -C "${{node_dir}}" fetch --depth 1 origin "${{commit_sha}}" >/dev/null 2>&1 || true
+          git -C "${{node_dir}}" checkout "${{commit_sha}}" >/dev/null 2>&1 || true
+        fi
+      fi
+      if [ -f "${{node_dir}}/requirements.txt" ]; then
+        pip_install_req "${{node_dir}}/requirements.txt"
+      fi
+    done < "${{DRIVE_ROOT}}/custom_nodes_repos.txt"
+  fi
+else
+  echo "=== [bootstrap] --no-drive mode: cleaning Drive symlinks & extra_model_paths.yaml ==="
+  for d in "${{COMFY_DIR}}/user/default" "${{COMFY_DIR}}/output" "${{COMFY_DIR}}/input"; do
+    if [ -L "${{d}}" ]; then
+      rm -f "${{d}}"
+      mkdir -p "${{d}}"
+      layout_changed=1
+    elif [ ! -d "${{d}}" ]; then
+      mkdir -p "${{d}}"
+    fi
+  done
+  if [ -f "${{COMFY_DIR}}/extra_model_paths.yaml" ]; then
+    rm -f "${{COMFY_DIR}}/extra_model_paths.yaml"
+    layout_changed=1
+  fi
+fi
 
 need_start=true
 takeover_state="NONE"
 if curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
   echo "=== [bootstrap] Existing ComfyUI detected; auditing launch flags ==="
-  takeover_state="$(python3 - "${{COMFY_PORT}}" <<'PY'
+  takeover_state="$(python3 - "${{COMFY_PORT}}" "${{layout_changed}}" <<'PY'
 import glob, json, os, sys, urllib.request
 
 port = int(sys.argv[1])
+layout_changed = int(sys.argv[2]) == 1
 port_hex = f":{{port:04X}}"
 listen_inodes = set()
 for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
@@ -114,7 +287,7 @@ for pid_dir in glob.glob("/proc/[0-9]*"):
     if any("main.py" in a for a in args) and "--enable-cors-header" in args:
         unsafe_pids.append(pid_dir)
 
-if not unsafe_pids:
+if not unsafe_pids and not layout_changed:
     print("SAFE_RUNNING")
     sys.exit(0)
 
@@ -127,7 +300,10 @@ except Exception:
     queue_empty = False
 
 if not queue_empty:
-    print("UNSAFE_BUSY")
+    if unsafe_pids:
+        print("UNSAFE_BUSY")
+    else:
+        print("LAYOUT_BUSY")
     sys.exit(0)
 
 print("NEEDS_RESTART")
@@ -138,6 +314,9 @@ PY
   elif [ "${{takeover_state}}" = "UNSAFE_BUSY" ]; then
     echo "{CORS_HEADER_BUSY_SENTINEL}"
     need_start=false
+  elif [ "${{takeover_state}}" = "LAYOUT_BUSY" ]; then
+    echo "{LAYOUT_CHANGED_BUSY_SENTINEL}"
+    need_start=false
   elif [ "${{takeover_state}}" = "NEEDS_RESTART" ]; then
     need_start=true
   fi
@@ -145,11 +324,7 @@ fi
 
 if [ "${{need_start}}" = true ]; then
   echo "=== [bootstrap] Installing Python dependencies ==="
-  if python3 -c "import torch; assert torch.cuda.is_available()" >/dev/null 2>&1; then
-    grep -Evi '^(torch|torchvision|torchaudio)($|[=<>!~ ;[])' "${{COMFY_DIR}}/requirements.txt" > /tmp/comfy_reqs.txt || true
-  else
-    cp "${{COMFY_DIR}}/requirements.txt" /tmp/comfy_reqs.txt
-  fi
+  cp "${{COMFY_DIR}}/requirements.txt" /tmp/comfy_reqs.txt
   pip_install_req /tmp/comfy_reqs.txt
   if [ -f "${{MANAGER_DIR}}/requirements.txt" ]; then
     pip_install_req "${{MANAGER_DIR}}/requirements.txt"
@@ -157,10 +332,11 @@ if [ "${{need_start}}" = true ]; then
 
   launch_new=true
   if [ "${{takeover_state}}" = "NEEDS_RESTART" ] && curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
-    recheck_state="$(python3 - "${{COMFY_PORT}}" <<'PY'
+    recheck_state="$(python3 - "${{COMFY_PORT}}" "${{layout_changed}}" <<'PY'
 import glob, json, os, signal, sys, urllib.request
 
 port = int(sys.argv[1])
+layout_changed = int(sys.argv[2]) == 1
 port_hex = f":{{port:04X}}"
 listen_inodes = set()
 for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
@@ -174,6 +350,7 @@ for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
     except OSError:
         continue
 
+all_comfy_pids = []
 unsafe_pids = []
 for pid_dir in glob.glob("/proc/[0-9]*"):
     try:
@@ -197,10 +374,13 @@ for pid_dir in glob.glob("/proc/[0-9]*"):
     except OSError:
         continue
     args = [a for a in raw.split("\x00") if a]
-    if any("main.py" in a for a in args) and "--enable-cors-header" in args:
-        unsafe_pids.append(pid)
+    if any("main.py" in a for a in args):
+        all_comfy_pids.append(pid)
+        if "--enable-cors-header" in args:
+            unsafe_pids.append(pid)
 
-if not unsafe_pids:
+target_pids = unsafe_pids if unsafe_pids else (all_comfy_pids if layout_changed else [])
+if not target_pids:
     print("SAFE_RUNNING")
     sys.exit(0)
 
@@ -213,10 +393,10 @@ except Exception:
     queue_empty = False
 
 if not queue_empty:
-    print("BECAME_BUSY")
+    print("BECAME_BUSY_UNSAFE" if unsafe_pids else "BECAME_BUSY_LAYOUT")
     sys.exit(0)
 
-for pid in unsafe_pids:
+for pid in target_pids:
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
@@ -226,11 +406,14 @@ PY
 )"
     if [ "${{recheck_state}}" = "SAFE_RUNNING" ]; then
       launch_new=false
-    elif [ "${{recheck_state}}" = "BECAME_BUSY" ]; then
+    elif [ "${{recheck_state}}" = "BECAME_BUSY_UNSAFE" ]; then
       echo "{CORS_HEADER_BUSY_SENTINEL}"
       launch_new=false
+    elif [ "${{recheck_state}}" = "BECAME_BUSY_LAYOUT" ]; then
+      echo "{LAYOUT_CHANGED_BUSY_SENTINEL}"
+      launch_new=false
     elif [ "${{recheck_state}}" = "STOP_SENT" ]; then
-      echo "=== [bootstrap] Restarting ComfyUI without --enable-cors-header ==="
+      echo "=== [bootstrap] Restarting ComfyUI cleanly ==="
       stopped=false
       for _ in $(seq 1 20); do
         if ! curl -sf "http://127.0.0.1:${{COMFY_PORT}}/system_stats" >/dev/null 2>&1; then
@@ -240,7 +423,7 @@ PY
         sleep 1
       done
       if [ "${{stopped}}" != true ]; then
-        echo "[bootstrap] Error: existing ComfyUI with --enable-cors-header did not stop within 20s" >&2
+        echo "[bootstrap] Error: existing ComfyUI did not stop within 20s" >&2
         exit 1
       fi
     fi
@@ -277,12 +460,15 @@ echo "{COMFY_READY_SENTINEL}"
 pub fn parse_bootstrap_output(out: &CommandOutput) -> Result<BootstrapOutcome, CoreError> {
     let mut ready = false;
     let mut cors_header_busy_warning = false;
+    let mut layout_changed_busy_warning = false;
     for line in out.stdout_raw.lines() {
         let trimmed = line.trim();
         if trimmed == COMFY_READY_SENTINEL {
             ready = true;
         } else if trimmed == CORS_HEADER_BUSY_SENTINEL {
             cors_header_busy_warning = true;
+        } else if trimmed == LAYOUT_CHANGED_BUSY_SENTINEL {
+            layout_changed_busy_warning = true;
         }
     }
     if !ready {
@@ -296,16 +482,18 @@ pub fn parse_bootstrap_output(out: &CommandOutput) -> Result<BootstrapOutcome, C
     }
     Ok(BootstrapOutcome {
         cors_header_busy_warning,
+        layout_changed_busy_warning,
     })
 }
 
 pub async fn run_remote_bootstrap(
     ctl_sock: &Path,
     comfy_port: u16,
+    use_drive: bool,
     runner: &dyn CommandRunner,
     on_line: Option<LineCallback>,
 ) -> Result<BootstrapOutcome, CoreError> {
-    let script = build_remote_setup_script(comfy_port);
+    let script = build_remote_setup_script(comfy_port, use_drive);
     let spec = build_mux_exec_spec(
         ctl_sock,
         "bash -s",
@@ -322,7 +510,7 @@ mod tests {
 
     #[test]
     fn bootstrap_script_never_launches_with_cors_header_and_audits_takeover() {
-        let script = build_remote_setup_script(8188);
+        let script = build_remote_setup_script(8188, true);
         assert!(script.contains("nohup python3 main.py --listen 127.0.0.1 --port \"${COMFY_PORT}\" >/content/comfyui.log"));
         for line in script.lines() {
             if line.contains("main.py --listen") {
@@ -335,6 +523,8 @@ mod tests {
         assert!(script.contains("--enable-cors-header"));
         assert!(script.contains("/proc/net/tcp"));
         assert!(script.contains("/queue"));
+        assert!(script.contains("/tmp/colab_constraints.txt"));
+        assert!(script.contains("-c /tmp/colab_constraints.txt"));
         assert!(script.contains(COMFY_READY_SENTINEL));
         let start_if_pos = script
             .find("if [ \"${need_start}\" = true ]; then")
@@ -348,7 +538,7 @@ mod tests {
 
     #[test]
     fn bootstrap_script_installs_deps_before_terminating_unsafe_comfy() {
-        let script = build_remote_setup_script(8188);
+        let script = build_remote_setup_script(8188, true);
         let pip_comfy_pos = script.find("pip_install_req /tmp/comfy_reqs.txt").unwrap();
         let pip_mgr_pos = script
             .find("pip_install_req \"${MANAGER_DIR}/requirements.txt\"")
@@ -364,7 +554,17 @@ mod tests {
             "SIGTERM should only appear in the post-install recheck block"
         );
         assert!(script.contains("NEEDS_RESTART"));
-        assert!(script.contains("BECAME_BUSY"));
+        assert!(script.contains("BECAME_BUSY_UNSAFE"));
+    }
+
+    #[test]
+    fn bootstrap_script_cleans_dangling_symlinks_and_yaml_in_no_drive_mode() {
+        let script = build_remote_setup_script(8188, false);
+        assert!(script.contains("USE_DRIVE=\"false\""));
+        assert!(script.contains("extra_model_paths.yaml"));
+        assert!(script.contains("if [ -L \"${d}\" ]; then"));
+        assert!(script.contains("verified_count != src_count or verified_bytes < src_bytes"));
+        assert!(script.contains("git -C \"${node_dir}\" checkout \"${commit_sha}\""));
     }
 
     #[test]
@@ -377,7 +577,8 @@ mod tests {
         assert_eq!(
             parse_bootstrap_output(&ok).unwrap(),
             BootstrapOutcome {
-                cors_header_busy_warning: false
+                cors_header_busy_warning: false,
+                layout_changed_busy_warning: false,
             }
         );
 
@@ -389,7 +590,8 @@ mod tests {
         assert_eq!(
             parse_bootstrap_output(&busy).unwrap(),
             BootstrapOutcome {
-                cors_header_busy_warning: true
+                cors_header_busy_warning: true,
+                layout_changed_busy_warning: false,
             }
         );
 

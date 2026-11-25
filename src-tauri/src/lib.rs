@@ -253,6 +253,53 @@ fn open_colab_manage_sessions() -> Result<(), UiError> {
 }
 
 #[tauri::command]
+fn open_external_url(url: String) -> Result<(), UiError> {
+    open_external_url_in_os(&url)
+}
+
+#[tauri::command]
+async fn confirm_drive_auth(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    Ok(state.manager.confirm_drive_auth().await)
+}
+
+#[tauri::command]
+async fn retry_drive_mount(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    Ok(state.manager.retry_drive_mount().await)
+}
+
+#[tauri::command]
+async fn skip_drive_for_session(state: tauri::State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    Ok(state.manager.skip_drive_for_session().await)
+}
+
+#[tauri::command]
+async fn export_to_drive_now(
+    state: tauri::State<'_, AppState>,
+    include_outputs: bool,
+) -> Result<colab_comfy_core::persistence::DriveExportReport, UiError> {
+    state
+        .manager
+        .export_to_drive_now(include_outputs)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
+async fn update_preferences(
+    state: tauri::State<'_, AppState>,
+    locale: Option<colab_comfy_core::i18n::Locale>,
+    use_drive: Option<bool>,
+    export_outputs_on_stop: Option<bool>,
+    privacy_mask: Option<bool>,
+) -> Result<AppSnapshot, UiError> {
+    state
+        .manager
+        .update_preferences(locale, use_drive, export_outputs_on_stop, privacy_mask)
+        .await
+        .map_err(|e| UiError::from(&e))
+}
+
+#[tauri::command]
 async fn stop_and_exit(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -347,6 +394,12 @@ pub fn run() {
             open_colab_url,
             open_colab_pay,
             open_colab_manage_sessions,
+            open_external_url,
+            confirm_drive_auth,
+            retry_drive_mount,
+            skip_drive_for_session,
+            export_to_drive_now,
+            update_preferences,
             stop_and_exit,
             leave_running_and_exit,
         ])

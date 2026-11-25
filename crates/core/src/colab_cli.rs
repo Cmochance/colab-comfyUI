@@ -54,6 +54,8 @@ pub struct StopReport {
     pub safe_to_clear_ledger: bool,
     pub usage: Option<UsageInfo>,
     pub billing_verified_stopped: bool,
+    #[serde(default)]
+    pub drive_sync_confirmed: Option<bool>,
     pub summary: String,
     pub warnings: Vec<String>,
 }
@@ -648,6 +650,7 @@ pub async fn stop_and_verify(
             safe_to_clear_ledger: false,
             usage: None,
             billing_verified_stopped: false,
+            drive_sync_confirmed: None,
             summary: "当前账号无法核验或已切换，未执行停机并已保留本地会话记录。".to_string(),
             warnings,
         });
@@ -816,6 +819,7 @@ pub async fn stop_and_verify(
         safe_to_clear_ledger,
         usage: usage_res,
         billing_verified_stopped,
+        drive_sync_confirmed: None,
         summary,
         warnings,
     })

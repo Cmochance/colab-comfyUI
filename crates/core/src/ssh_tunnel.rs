@@ -625,6 +625,7 @@ mod tests {
             high_mem: false,
             hardware_summary: "NVIDIA L4".to_string(),
             local_port: LOCAL_PROXY_PORT,
+            drive_enabled: false,
             created_at_unix: 1,
         };
         save_json_0600(&active_session_path(&tmp.0), &session).unwrap();
@@ -693,6 +694,7 @@ mod tests {
             high_mem: false,
             hardware_summary: "NVIDIA L4".to_string(),
             local_port: LOCAL_PROXY_PORT,
+            drive_enabled: false,
             created_at_unix: 1,
         };
         save_json_0600(&active_session_path(&tmp.0), &session).unwrap();
